@@ -114,10 +114,12 @@ access points using the same SSID.
 
 - Roam check interval: 60 seconds
 - A roam scan is only started when the current RSSI is below -72 dBm
-- A different BSSID must be at least 6 dB better than the current AP
+- A different BSSID must be at least 4 dB better than the current AP
 - The camera reconnects directly to the selected BSSID and channel
 - If the roam does not succeed, normal reconnect/fallback handling resumes
 - Roam attempts and successes are visible in `/status`
 
 This hysteresis avoids unnecessary switching between access points with nearly
 identical signal levels.
+
+- Firmware v0.6.2 also logs the best roam candidate BSSID and its RSSI, even when the threshold is not met.

@@ -3,11 +3,10 @@
 #include <Preferences.h>
 #include "esp_camera.h"
 #include "esp_http_server.h"
-#include <time.h>
 
 #include "camera_pins.h"
 
-static const char *APP_VERSION = "0.8.1";
+static const char *APP_VERSION = "0.8.2";
 static const char *AP_PASSWORD = "esp32cam123";
 static const unsigned long WIFI_CONNECT_TIMEOUT_MS = 30000;
 static const unsigned long WIFI_RETRY_INTERVAL_MS = 30000;
@@ -136,42 +135,6 @@ static const char *wifiSignalRating(int32_t rssi) {
   return "schlecht";
 }
 
-
-static bool timeIsSynchronized() {
-  return time(nullptr) >= 1700000000;
-}
-
-static String currentLocalTime() {
-  if (!timeIsSynchronized()) return "";
-
-  time_t now = time(nullptr);
-  struct tm tmNow;
-  localtime_r(&now, &tmNow);
-
-  char buffer[24];
-  strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &tmNow);
-  return String(buffer);
-}
-
-static void syncClock() {
-  if (WiFi.status() != WL_CONNECTED) return;
-
-  // Austria: CET/CEST with automatic daylight-saving transition.
-  configTzTime("CET-1CEST,M3.5.0,M10.5.0",
-               "pool.ntp.org",
-               "time.nist.gov");
-
-  unsigned long started = millis();
-  while (!timeIsSynchronized() && millis() - started < 5000) {
-    delay(100);
-  }
-
-  if (timeIsSynchronized()) {
-    Serial.printf("NTP time synchronized: %s\n", currentLocalTime().c_str());
-  } else {
-    Serial.println("NTP synchronization unavailable");
-  }
-}
 
 static bool loadWifiConfig() {
   prefs.begin("wifi", true);
@@ -383,7 +346,6 @@ static void maintainWifi() {
       }
 
       wifiLastConnectedMillis = millis();
-      syncClock();
       Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
       Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
 
@@ -1034,11 +996,6 @@ static esp_err_t status_handler(httpd_req_t *req) {
   body += String(millis() / 1000UL);
   body += F(",\"free_heap\":");
   body += String(ESP.getFreeHeap());
-  body += F(",\"time_synchronized\":");
-  body += timeIsSynchronized() ? "true" : "false";
-  body += F(",\"local_time\":\"");
-  body += currentLocalTime();
-  body += F("\"");
   body += F(",\"psram\":");
   body += psramFound() ? "true" : "false";
   body += F(",\"psram_size\":");
@@ -1276,8 +1233,6 @@ void setup() {
 
   if (!connectWifi()) {
     startAccessPoint();
-  } else {
-    syncClock();
   }
 
   startWebServers();

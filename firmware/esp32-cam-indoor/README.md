@@ -205,3 +205,25 @@ synchronizes in the background.
 - The serial console prints a compact firmware/status heartbeat every 60 seconds
   with firmware version, uptime, IP/RSSI/BSSID, camera resolution/quality and
   memory information
+
+
+## v0.8.6 persistent system log
+
+The camera can now keep its own persistent application log in LittleFS so a
+USB serial connection is no longer required for normal diagnostics.
+
+- Log file: `/system.log`
+- Maximum size: 128 KiB; when the limit is reached the file is rotated by
+  starting a fresh log
+- Web view: `/logs`
+- Full download: `/logs/download`
+- Clear log: `/logs/clear`
+- The root page links directly to the system log
+- Existing serial output remains active; application messages are written to
+  both Serial and the persistent log
+- Before NTP synchronization, entries use uptime-based timestamps. Afterwards
+  they use local CET/CEST time.
+
+Low-level ESP-IDF/camera-driver messages that are emitted directly by the
+framework (for example some `cam_hal` diagnostics) are not guaranteed to pass
+through the application logger.

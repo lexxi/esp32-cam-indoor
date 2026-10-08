@@ -1,13 +1,15 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <Preferences.h>
+#include <LittleFS.h>
+#include <stdarg.h>
 #include "esp_camera.h"
 #include "esp_http_server.h"
 #include <time.h>
 
 #include "camera_pins.h"
 
-static const char *APP_VERSION = "0.8.5";
+static const char *APP_VERSION = "0.8.6";
 static const char *AP_PASSWORD = "esp32cam123";
 static const unsigned long WIFI_CONNECT_TIMEOUT_MS = 30000;
 static const unsigned long WIFI_RETRY_INTERVAL_MS = 30000;
@@ -15,9 +17,14 @@ static const unsigned long WIFI_ROAM_CHECK_INTERVAL_MS = 60000;
 static const unsigned long CONSOLE_STATUS_INTERVAL_MS = 60000;
 static const int WIFI_ROAM_TRIGGER_RSSI_DEFAULT = -72;
 static const int WIFI_ROAM_MIN_IMPROVEMENT_DB_DEFAULT = 4;
+static const char *LOG_FILE = "/system.log";
+static const size_t LOG_MAX_BYTES = 128 * 1024;
 
 static httpd_handle_t http_server = nullptr;
 static httpd_handle_t stream_server = nullptr;
+
+static String logBuffer;
+static bool logReady = false;
 
 static Preferences prefs;
 static String wifiSsid;
@@ -55,6 +62,121 @@ static bool flashLedOn = false;
 static const char *STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=frame";
 static const char *STREAM_BOUNDARY = "\r\n--frame\r\n";
 static const char *STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
+static String logTimestamp() {
+  if (time(nullptr) >= 1700000000) {
+    time_t now = time(nullptr);
+    struct tm tmNow;
+    localtime_r(&now, &tmNow);
+
+    char buffer[32];
+    strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &tmNow);
+    return String(buffer);
+  }
+
+  return String("+") + String(millis() / 1000.0, 3) + "s";
+}
+
+static void writeLogLine(const String &line) {
+  if (!logReady) return;
+
+  if (LittleFS.exists(LOG_FILE)) {
+    File existing = LittleFS.open(LOG_FILE, "r");
+    if (existing) {
+      const size_t currentSize = existing.size();
+      existing.close();
+
+      // Simple rotation: once the log reaches the limit, start a fresh file.
+      if (currentSize >= LOG_MAX_BYTES) {
+        LittleFS.remove(LOG_FILE);
+      }
+    }
+  }
+
+  File file = LittleFS.open(LOG_FILE, "a");
+  if (!file) return;
+
+  file.print("[");
+  file.print(logTimestamp());
+  file.print("] ");
+  file.println(line);
+  file.close();
+}
+
+static void appendLogText(const String &text) {
+  for (size_t i = 0; i < text.length(); i++) {
+    const char c = text[i];
+
+    if (c == '\n') {
+      if (logBuffer.endsWith("\r")) {
+        logBuffer.remove(logBuffer.length() - 1);
+      }
+      writeLogLine(logBuffer);
+      logBuffer = "";
+    } else {
+      logBuffer += c;
+
+      if (logBuffer.length() > 1024) {
+        writeLogLine(logBuffer);
+        logBuffer = "";
+      }
+    }
+  }
+}
+
+template <typename T>
+static void logPrint(const T &value) {
+  Serial.print(value);
+  appendLogText(String(value));
+}
+
+static void logPrintln() {
+  Serial.println();
+  writeLogLine(logBuffer);
+  logBuffer = "";
+}
+
+template <typename T>
+static void logPrintln(const T &value) {
+  Serial.println(value);
+  appendLogText(String(value));
+  writeLogLine(logBuffer);
+  logBuffer = "";
+}
+
+static void logPrintf(const char *format, ...) {
+  char buffer[512];
+
+  va_list args;
+  va_start(args, format);
+  vsnprintf(buffer, sizeof(buffer), format, args);
+  va_end(args);
+
+  Serial.print(buffer);
+  appendLogText(String(buffer));
+}
+
+static void initLogger() {
+  if (!LittleFS.begin(true)) {
+    Serial.println("LittleFS mount failed; persistent log disabled");
+    return;
+  }
+
+  File file;
+  if (LittleFS.exists(LOG_FILE)) {
+    file = LittleFS.open(LOG_FILE, "a");
+  } else {
+    file = LittleFS.open(LOG_FILE, "w");
+  }
+
+  if (file) {
+    file.close();
+    logReady = true;
+    Serial.println("Persistent logger initialized");
+  } else {
+    Serial.println("ERROR: cannot create/open persistent log file");
+  }
+}
 
 static String htmlEscape(const String &value) {
   String out;
@@ -167,7 +289,7 @@ static void startNtpSync() {
                "time.nist.gov");
   ntpStarted = true;
   ntpLoggedSynchronized = false;
-  Serial.println("NTP synchronization started (background)");
+  logPrintln("NTP synchronization started (background)");
 }
 
 static void maintainNtp() {
@@ -183,7 +305,7 @@ static void maintainNtp() {
 
   if (timeIsSynchronized() && !ntpLoggedSynchronized) {
     ntpLoggedSynchronized = true;
-    Serial.printf("NTP synchronized: %s\n", currentLocalTime().c_str());
+    logPrintf("NTP synchronized: %s\n", currentLocalTime().c_str());
   }
 }
 
@@ -191,28 +313,28 @@ static void logConsoleStatus() {
   if (millis() - consoleLastStatusMillis < CONSOLE_STATUS_INTERVAL_MS) return;
   consoleLastStatusMillis = millis();
 
-  Serial.printf("[FW %s] uptime=%lus", APP_VERSION, millis() / 1000UL);
+  logPrintf("[FW %s] uptime=%lus", APP_VERSION, millis() / 1000UL);
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf(" wifi=%s rssi=%d bssid=%s",
+    logPrintf(" wifi=%s rssi=%d bssid=%s",
                   WiFi.localIP().toString().c_str(),
                   WiFi.RSSI(),
                   WiFi.BSSIDstr().c_str());
   } else {
-    Serial.print(" wifi=disconnected");
+    logPrint(" wifi=disconnected");
   }
 
-  Serial.printf(" camera=%s q=%d heap=%u psram_free=%u",
+  logPrintf(" camera=%s q=%d heap=%u psram_free=%u",
                 frameSizeName(cameraSettings.frameSize).c_str(),
                 cameraSettings.jpegQuality,
                 ESP.getFreeHeap(),
                 ESP.getFreePsram());
 
   if (timeIsSynchronized()) {
-    Serial.printf(" time=%s", currentLocalTime().c_str());
+    logPrintf(" time=%s", currentLocalTime().c_str());
   }
 
-  Serial.println();
+  logPrintln();
 }
 
 
@@ -368,16 +490,16 @@ static void startAccessPoint() {
     WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
   }
 
-  Serial.println();
-  Serial.println("Fallback AP started");
-  Serial.printf("SSID: %s\n", ssid.c_str());
-  Serial.printf("Password: %s\n", AP_PASSWORD);
-  Serial.printf("AP IP: %s\n", WiFi.softAPIP().toString().c_str());
+  logPrintln();
+  logPrintln("Fallback AP started");
+  logPrintf("SSID: %s\n", ssid.c_str());
+  logPrintf("Password: %s\n", AP_PASSWORD);
+  logPrintf("AP IP: %s\n", WiFi.softAPIP().toString().c_str());
 }
 
 static bool connectWifi() {
   if (!loadWifiConfig()) {
-    Serial.println("No stored Wi-Fi configuration");
+    logPrintln("No stored Wi-Fi configuration");
     return false;
   }
 
@@ -387,31 +509,31 @@ static bool connectWifi() {
   WiFi.persistent(false);
   WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
 
-  Serial.printf("Connecting to Wi-Fi SSID: %s", wifiSsid.c_str());
+  logPrintf("Connecting to Wi-Fi SSID: %s", wifiSsid.c_str());
 
   const unsigned long started = millis();
 
   while (WiFi.status() != WL_CONNECTED &&
          millis() - started < WIFI_CONNECT_TIMEOUT_MS) {
     delay(250);
-    Serial.print('.');
+    logPrint('.');
   }
 
-  Serial.println();
+  logPrintln();
 
   if (WiFi.status() == WL_CONNECTED) {
     apMode = false;
     wifiWasConnected = true;
     wifiLastConnectedMillis = millis();
 
-    Serial.println("Wi-Fi connected");
+    logPrintln("Wi-Fi connected");
     startNtpSync();
-    Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
-    Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
+    logPrintf("IP: %s\n", WiFi.localIP().toString().c_str());
+    logPrintf("RSSI: %d dBm\n", WiFi.RSSI());
     return true;
   }
 
-  Serial.println("Wi-Fi connection failed");
+  logPrintln("Wi-Fi connection failed");
   return false;
 }
 
@@ -424,24 +546,24 @@ static void maintainWifi() {
       if (wifiRoamInProgress) {
         wifiRoamSuccesses++;
         wifiRoamInProgress = false;
-        Serial.println("Wi-Fi roam completed");
+        logPrintln("Wi-Fi roam completed");
       } else {
         wifiReconnectSuccesses++;
-        Serial.println("Wi-Fi reconnected");
+        logPrintln("Wi-Fi reconnected");
       }
 
       wifiLastConnectedMillis = millis();
       ntpStarted = false;
       startNtpSync();
-      Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
-      Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
+      logPrintf("IP: %s\n", WiFi.localIP().toString().c_str());
+      logPrintf("RSSI: %d dBm\n", WiFi.RSSI());
 
       if (apMode) {
         WiFi.softAPdisconnect(true);
         WiFi.mode(WIFI_STA);
         WiFi.setSleep(false);
         apMode = false;
-        Serial.println("Fallback AP stopped");
+        logPrintln("Fallback AP stopped");
       }
     }
 
@@ -450,7 +572,7 @@ static void maintainWifi() {
 
   if (wifiWasConnected) {
     wifiWasConnected = false;
-    Serial.println("Wi-Fi connection lost");
+    logPrintln("Wi-Fi connection lost");
   }
 
   if (wifiSsid.length() == 0) {
@@ -463,14 +585,14 @@ static void maintainWifi() {
   }
 
   if (wifiRoamInProgress) {
-    Serial.println("Wi-Fi roam timed out; falling back to normal reconnect");
+    logPrintln("Wi-Fi roam timed out; falling back to normal reconnect");
     wifiRoamInProgress = false;
   }
 
   wifiLastRetryMillis = millis();
   wifiReconnectAttempts++;
 
-  Serial.printf("Wi-Fi reconnect attempt %lu\n", wifiReconnectAttempts);
+  logPrintf("Wi-Fi reconnect attempt %lu\n", wifiReconnectAttempts);
 
   if (!apMode) {
     startAccessPoint();
@@ -504,7 +626,7 @@ static void checkForBetterAccessPoint() {
 
   const String currentBssid = WiFi.BSSIDstr();
 
-  Serial.printf("Roam scan: current AP %s at %d dBm\n",
+  logPrintf("Roam scan: current AP %s at %d dBm\n",
                 currentBssid.c_str(), currentRssi);
 
   int networkCount = WiFi.scanNetworks(false, false);
@@ -549,17 +671,17 @@ static void checkForBetterAccessPoint() {
   WiFi.scanDelete();
 
   if (!betterApFound) {
-    Serial.println("Roam scan: no other AP with the configured SSID found");
+    logPrintln("Roam scan: no other AP with the configured SSID found");
     return;
   }
 
-  Serial.printf("Roam scan: best candidate %s at %d dBm (%+d dB)\n",
+  logPrintf("Roam scan: best candidate %s at %d dBm (%+d dB)\n",
                 bestBssidString.c_str(),
                 bestRssi,
                 bestRssi - currentRssi);
 
   if (bestRssi < currentRssi + wifiRoamMinImprovementDb) {
-    Serial.printf("Roam scan: improvement below %d dB threshold, staying on current AP\n",
+    logPrintf("Roam scan: improvement below %d dB threshold, staying on current AP\n",
                   wifiRoamMinImprovementDb);
     return;
   }
@@ -568,7 +690,7 @@ static void checkForBetterAccessPoint() {
   wifiRoamInProgress = true;
   wifiRoamTargetBssid = bestBssidString;
 
-  Serial.printf("Roaming from %s (%d dBm) to %s (%d dBm), channel %d\n",
+  logPrintf("Roaming from %s (%d dBm) to %s (%d dBm), channel %d\n",
                 currentBssid.c_str(),
                 currentRssi,
                 bestBssidString.c_str(),
@@ -639,7 +761,8 @@ static String rootPage() {
   html += F("<div class='meta'><a href='/jpg'>Snapshot</a> · ");
   html += F("<a href='/status'>Status JSON</a> · ");
   html += F("<a href='/camera'>Kamera-Settings</a> · ");
-  html += F("<a href='/config'>WLAN-Konfiguration</a></div>");
+  html += F("<a href='/config'>WLAN-Konfiguration</a> · ");
+  html += F("<a href='/logs'>System-Log</a></div>");
 
   html += F("<div class='meta' style='margin-top:18px'><b>Flash-LED:</b> ");
   html += flashLedOn ? "AN" : "AUS";
@@ -1121,6 +1244,119 @@ static esp_err_t jpg_handler(httpd_req_t *req) {
   return result;
 }
 
+static esp_err_t logs_handler(httpd_req_t *req) {
+  httpd_resp_set_type(req, "text/html; charset=utf-8");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+
+  String header;
+  header.reserve(1400);
+  header += F("<!doctype html><html lang='de'><head><meta charset='utf-8'>");
+  header += F("<meta name='viewport' content='width=device-width,initial-scale=1'>");
+  header += F("<title>ESP32-CAM System-Log</title>");
+  header += F("<style>body{font-family:system-ui,sans-serif;max-width:1000px;margin:20px auto;padding:0 15px;background:#111;color:#eee}");
+  header += F("pre{background:#1b1b1b;color:#ddd;padding:15px;border-radius:8px;white-space:pre-wrap;overflow:auto}");
+  header += F("a{color:#8ec5ff;margin-right:14px}</style></head><body>");
+  header += F("<h1>System-Log</h1><p>Firmware v");
+  header += APP_VERSION;
+  header += F("</p><p><a href='/logs/download'>Log herunterladen</a>");
+  header += F("<a href='/logs/clear' onclick=\"return confirm('Log wirklich löschen?')\">Log löschen</a>");
+  header += F("<a href='/'>Zurück</a></p><pre>");
+
+  esp_err_t result = httpd_resp_send_chunk(req, header.c_str(), header.length());
+  if (result != ESP_OK) return result;
+
+  File file = LittleFS.open(LOG_FILE, "r");
+  if (!file) {
+    result = httpd_resp_send_chunk(req, "No log entries.\n", HTTPD_RESP_USE_STRLEN);
+  } else {
+    const size_t size = file.size();
+
+    // Keep the browser view compact; the download endpoint always returns the
+    // complete persistent file.
+    if (size > 20000) {
+      file.seek(size - 20000, SeekSet);
+      result = httpd_resp_send_chunk(
+          req,
+          "[... Logansicht gekürzt; vollständiger Log über Download ...]\n",
+          HTTPD_RESP_USE_STRLEN);
+    }
+
+    String chunk;
+    chunk.reserve(768);
+
+    while (result == ESP_OK && file.available()) {
+      const char c = static_cast<char>(file.read());
+
+      if (c == '&') chunk += F("&amp;");
+      else if (c == '<') chunk += F("&lt;");
+      else if (c == '>') chunk += F("&gt;");
+      else chunk += c;
+
+      if (chunk.length() >= 512) {
+        result = httpd_resp_send_chunk(req, chunk.c_str(), chunk.length());
+        chunk = "";
+      }
+    }
+
+    if (result == ESP_OK && chunk.length() > 0) {
+      result = httpd_resp_send_chunk(req, chunk.c_str(), chunk.length());
+    }
+
+    file.close();
+  }
+
+  if (result == ESP_OK) {
+    const char *footer = "</pre><p><a href='/logs'>Refresh</a> · <a href='/'>Zurück</a></p></body></html>";
+    result = httpd_resp_send_chunk(req, footer, HTTPD_RESP_USE_STRLEN);
+  }
+
+  httpd_resp_send_chunk(req, nullptr, 0);
+  return result;
+}
+
+static esp_err_t logs_download_handler(httpd_req_t *req) {
+  File file = LittleFS.open(LOG_FILE, "r");
+  if (!file) {
+    httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Log file not found");
+    return ESP_FAIL;
+  }
+
+  httpd_resp_set_type(req, "text/plain; charset=utf-8");
+  httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=esp32-cam-system.log");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+  uint8_t buffer[768];
+  esp_err_t result = ESP_OK;
+
+  while (file.available() && result == ESP_OK) {
+    const size_t count = file.read(buffer, sizeof(buffer));
+    if (count > 0) {
+      result = httpd_resp_send_chunk(
+          req,
+          reinterpret_cast<const char *>(buffer),
+          count);
+    }
+  }
+
+  file.close();
+  httpd_resp_send_chunk(req, nullptr, 0);
+  return result;
+}
+
+static esp_err_t logs_clear_handler(httpd_req_t *req) {
+  LittleFS.remove(LOG_FILE);
+
+  File file = LittleFS.open(LOG_FILE, "w");
+  if (file) file.close();
+
+  httpd_resp_set_status(req, "303 See Other");
+  httpd_resp_set_hdr(req, "Location", "/logs");
+  esp_err_t result = httpd_resp_send(req, nullptr, 0);
+
+  logPrintln("System log cleared");
+  return result;
+}
+
 static esp_err_t status_handler(httpd_req_t *req) {
   String body;
   body.reserve(1200);
@@ -1216,7 +1452,7 @@ static esp_err_t stream_handler(httpd_req_t *req) {
   while (true) {
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
-      Serial.println("Camera capture failed");
+      logPrintln("Camera capture failed");
       return ESP_FAIL;
     }
 
@@ -1245,7 +1481,7 @@ static void startWebServers() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = 80;
   config.ctrl_port = 32768;
-  config.max_uri_handlers = 12;
+  config.max_uri_handlers = 16;
 
   if (httpd_start(&http_server, &config) == ESP_OK) {
     httpd_uri_t rootUri = {};
@@ -1289,6 +1525,24 @@ static void startWebServers() {
     statusUri.method = HTTP_GET;
     statusUri.handler = status_handler;
     httpd_register_uri_handler(http_server, &statusUri);
+
+    httpd_uri_t logsUri = {};
+    logsUri.uri = "/logs";
+    logsUri.method = HTTP_GET;
+    logsUri.handler = logs_handler;
+    httpd_register_uri_handler(http_server, &logsUri);
+
+    httpd_uri_t logsDownloadUri = {};
+    logsDownloadUri.uri = "/logs/download";
+    logsDownloadUri.method = HTTP_GET;
+    logsDownloadUri.handler = logs_download_handler;
+    httpd_register_uri_handler(http_server, &logsDownloadUri);
+
+    httpd_uri_t logsClearUri = {};
+    logsClearUri.uri = "/logs/clear";
+    logsClearUri.method = HTTP_GET;
+    logsClearUri.handler = logs_clear_handler;
+    httpd_register_uri_handler(http_server, &logsClearUri);
 
     httpd_uri_t flashOnUri = {};
     flashOnUri.uri = "/flash/on";
@@ -1364,14 +1618,14 @@ static bool initCamera() {
   config.grab_mode =
       highResolution ? CAMERA_GRAB_WHEN_EMPTY : CAMERA_GRAB_LATEST;
 
-  Serial.printf("Camera buffering: %s, fb_count=%d\n",
+  logPrintf("Camera buffering: %s, fb_count=%d\n",
                 highResolution ? "stable high-resolution" : "low-latency stream",
                 config.fb_count);
 
   esp_err_t err = esp_camera_init(&config);
 
   if (err != ESP_OK) {
-    Serial.printf("Camera init failed: 0x%x\n", err);
+    logPrintf("Camera init failed: 0x%x\n", err);
     return false;
   }
 
@@ -1382,12 +1636,13 @@ static bool initCamera() {
 void setup() {
   Serial.begin(115200);
   delay(500);
+  initLogger();
 
-  Serial.println();
-  Serial.println("================================");
-  Serial.println("ESP32-CAM Indoor");
-  Serial.printf("Firmware version: v%s\n", APP_VERSION);
-  Serial.println("================================");
+  logPrintln();
+  logPrintln("================================");
+  logPrintln("ESP32-CAM Indoor");
+  logPrintf("Firmware version: v%s\n", APP_VERSION);
+  logPrintln("================================");
 
   loadCameraConfig();
   loadRoamingConfig();
@@ -1407,13 +1662,13 @@ void setup() {
   startWebServers();
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("Web UI:   http://%s/\n", WiFi.localIP().toString().c_str());
-    Serial.printf("Snapshot: http://%s/jpg\n", WiFi.localIP().toString().c_str());
-    Serial.printf("Stream:   http://%s:81/stream\n", WiFi.localIP().toString().c_str());
+    logPrintf("Web UI:   http://%s/\n", WiFi.localIP().toString().c_str());
+    logPrintf("Snapshot: http://%s/jpg\n", WiFi.localIP().toString().c_str());
+    logPrintf("Stream:   http://%s:81/stream\n", WiFi.localIP().toString().c_str());
   }
 
   if (apMode) {
-    Serial.printf("Config UI: http://%s/config\n", WiFi.softAPIP().toString().c_str());
+    logPrintf("Config UI: http://%s/config\n", WiFi.softAPIP().toString().c_str());
   }
 }
 

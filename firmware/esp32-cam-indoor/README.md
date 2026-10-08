@@ -17,6 +17,9 @@ Arduino firmware for the AI-Thinker style ESP32-CAM + OV2640.
 - Wi-Fi configuration page with RSSI, BSSID, channel and reconnect counters
 - Wi-Fi scan directly from fallback AP mode
 - Click a detected SSID and join it from the configuration page
+- Persistent camera settings stored in ESP32 NVS
+- Camera configuration page under `/camera`
+- Resolution, JPEG quality, brightness, contrast, saturation, vertical flip and horizontal mirror
 
 ## First setup
 
@@ -46,10 +49,27 @@ The Wi-Fi behavior intentionally follows the pattern used in the MGE UPS Control
 - The configuration page remains available under `/config`.
 - In fallback mode the AP and station interfaces run together, so scanning and joining are possible without first leaving the camera AP.
 
+## Camera configuration
+
+Camera settings are stored in the ESP32 NVS namespace `camera` and survive reboot/power loss.
+
+Current configurable values:
+
+- Resolution: 160x120 up to 1600x1200
+- JPEG quality: 4 to 63 (lower value = better image quality / larger frames)
+- Brightness: -2 to 2
+- Contrast: -2 to 2
+- Saturation: -2 to 2
+- Vertical flip
+- Horizontal mirror
+
+Changes are applied immediately and also used after the next reboot.
+
 ## Endpoints
 
 - `http://<camera-ip>/` - browser UI
 - `http://<camera-ip>/config` - Wi-Fi configuration
+- `http://<camera-ip>/camera` - camera settings
 - `http://<camera-ip>/jpg` - single JPEG snapshot
 - `http://<camera-ip>/status` - status JSON
 - `http://<camera-ip>:81/stream` - MJPEG stream

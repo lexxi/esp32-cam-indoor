@@ -16,6 +16,7 @@ Arduino firmware for the AI-Thinker style ESP32-CAM + OV2640.
 - Fallback AP shuts down automatically after the configured Wi-Fi reconnects
 - Wi-Fi configuration page with RSSI, BSSID, channel and reconnect counters
 - Wi-Fi scan directly from fallback AP mode
+- Scan table includes BSSID/MAC to help identify multiple SSIDs from the same access point
 - Click a detected SSID and join it from the configuration page
 - Persistent camera settings stored in ESP32 NVS
 - Camera configuration page under `/camera`

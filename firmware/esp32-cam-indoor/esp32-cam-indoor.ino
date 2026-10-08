@@ -9,7 +9,7 @@
 
 #include "camera_pins.h"
 
-static const char *APP_VERSION = "0.8.6";
+static const char *APP_VERSION = "0.8.7";
 static const char *AP_PASSWORD = "esp32cam123";
 static const unsigned long WIFI_CONNECT_TIMEOUT_MS = 30000;
 static const unsigned long WIFI_RETRY_INTERVAL_MS = 30000;
@@ -124,8 +124,12 @@ static void appendLogText(const String &text) {
   }
 }
 
-template <typename T>
-static void logPrint(const T &value) {
+static void logPrint(const char *value) {
+  Serial.print(value);
+  appendLogText(String(value));
+}
+
+static void logPrint(char value) {
   Serial.print(value);
   appendLogText(String(value));
 }
@@ -136,10 +140,16 @@ static void logPrintln() {
   logBuffer = "";
 }
 
-template <typename T>
-static void logPrintln(const T &value) {
+static void logPrintln(const char *value) {
   Serial.println(value);
   appendLogText(String(value));
+  writeLogLine(logBuffer);
+  logBuffer = "";
+}
+
+static void logPrintln(const String &value) {
+  Serial.println(value);
+  appendLogText(value);
   writeLogLine(logBuffer);
   logBuffer = "";
 }

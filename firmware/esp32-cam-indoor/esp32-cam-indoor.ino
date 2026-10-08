@@ -3,14 +3,16 @@
 #include <Preferences.h>
 #include "esp_camera.h"
 #include "esp_http_server.h"
+#include <time.h>
 
 #include "camera_pins.h"
 
-static const char *APP_VERSION = "0.8.4";
+static const char *APP_VERSION = "0.8.5";
 static const char *AP_PASSWORD = "esp32cam123";
 static const unsigned long WIFI_CONNECT_TIMEOUT_MS = 30000;
 static const unsigned long WIFI_RETRY_INTERVAL_MS = 30000;
 static const unsigned long WIFI_ROAM_CHECK_INTERVAL_MS = 60000;
+static const unsigned long CONSOLE_STATUS_INTERVAL_MS = 60000;
 static const int WIFI_ROAM_TRIGGER_RSSI_DEFAULT = -72;
 static const int WIFI_ROAM_MIN_IMPROVEMENT_DB_DEFAULT = 4;
 
@@ -33,6 +35,9 @@ static bool wifiRoamInProgress = false;
 static String wifiRoamTargetBssid;
 static int wifiRoamTriggerRssi = WIFI_ROAM_TRIGGER_RSSI_DEFAULT;
 static int wifiRoamMinImprovementDb = WIFI_ROAM_MIN_IMPROVEMENT_DB_DEFAULT;
+static bool ntpStarted = false;
+static bool ntpLoggedSynchronized = false;
+static unsigned long consoleLastStatusMillis = 0;
 
 struct CameraSettings {
   framesize_t frameSize = FRAMESIZE_VGA;
@@ -127,12 +132,87 @@ static String fallbackApSsid() {
   return "ESP32-CAM-" + chipSuffix();
 }
 
+static String frameSizeName(framesize_t size);
+
 static const char *wifiSignalRating(int32_t rssi) {
   if (rssi >= -50) return "sehr gut";
   if (rssi >= -60) return "gut";
   if (rssi >= -67) return "brauchbar";
   if (rssi >= -70) return "grenzwertig";
   return "schlecht";
+}
+
+static bool timeIsSynchronized() {
+  return time(nullptr) >= 1700000000;
+}
+
+static String currentLocalTime() {
+  if (!timeIsSynchronized()) return "";
+
+  time_t now = time(nullptr);
+  struct tm tmNow;
+  localtime_r(&now, &tmNow);
+
+  char buffer[24];
+  strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &tmNow);
+  return String(buffer);
+}
+
+static void startNtpSync() {
+  if (WiFi.status() != WL_CONNECTED || ntpStarted) return;
+
+  // Non-blocking NTP setup. SNTP synchronizes in the background.
+  configTzTime("CET-1CEST,M3.5.0,M10.5.0",
+               "pool.ntp.org",
+               "time.nist.gov");
+  ntpStarted = true;
+  ntpLoggedSynchronized = false;
+  Serial.println("NTP synchronization started (background)");
+}
+
+static void maintainNtp() {
+  if (WiFi.status() != WL_CONNECTED) {
+    ntpStarted = false;
+    ntpLoggedSynchronized = false;
+    return;
+  }
+
+  if (!ntpStarted) {
+    startNtpSync();
+  }
+
+  if (timeIsSynchronized() && !ntpLoggedSynchronized) {
+    ntpLoggedSynchronized = true;
+    Serial.printf("NTP synchronized: %s\n", currentLocalTime().c_str());
+  }
+}
+
+static void logConsoleStatus() {
+  if (millis() - consoleLastStatusMillis < CONSOLE_STATUS_INTERVAL_MS) return;
+  consoleLastStatusMillis = millis();
+
+  Serial.printf("[FW %s] uptime=%lus", APP_VERSION, millis() / 1000UL);
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf(" wifi=%s rssi=%d bssid=%s",
+                  WiFi.localIP().toString().c_str(),
+                  WiFi.RSSI(),
+                  WiFi.BSSIDstr().c_str());
+  } else {
+    Serial.print(" wifi=disconnected");
+  }
+
+  Serial.printf(" camera=%s q=%d heap=%u psram_free=%u",
+                frameSizeName(cameraSettings.frameSize).c_str(),
+                cameraSettings.jpegQuality,
+                ESP.getFreeHeap(),
+                ESP.getFreePsram());
+
+  if (timeIsSynchronized()) {
+    Serial.printf(" time=%s", currentLocalTime().c_str());
+  }
+
+  Serial.println();
 }
 
 
@@ -325,6 +405,7 @@ static bool connectWifi() {
     wifiLastConnectedMillis = millis();
 
     Serial.println("Wi-Fi connected");
+    startNtpSync();
     Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
     Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
     return true;
@@ -350,6 +431,8 @@ static void maintainWifi() {
       }
 
       wifiLastConnectedMillis = millis();
+      ntpStarted = false;
+      startNtpSync();
       Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
       Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
 
@@ -528,6 +611,14 @@ static String rootPage() {
   html += F("<p>Firmware <b>v");
   html += APP_VERSION;
   html += F("</b></p>");
+
+  html += F("<p class='meta'>Zeit: ");
+  if (timeIsSynchronized()) {
+    html += currentLocalTime();
+  } else {
+    html += F("NTP noch nicht synchronisiert");
+  }
+  html += F("</p>");
 
   if (apMode) {
     html += F("<p class='warn'><b>Fallback AP aktiv</b></p>");
@@ -1055,6 +1146,11 @@ static esp_err_t status_handler(httpd_req_t *req) {
   body += String(millis() / 1000UL);
   body += F(",\"free_heap\":");
   body += String(ESP.getFreeHeap());
+  body += F(",\"time_synchronized\":");
+  body += timeIsSynchronized() ? "true" : "false";
+  body += F(",\"local_time\":\"");
+  body += currentLocalTime();
+  body += F("\"");
   body += F(",\"psram\":");
   body += psramFound() ? "true" : "false";
   body += F(",\"psram_size\":");
@@ -1323,6 +1419,8 @@ void setup() {
 
 void loop() {
   maintainWifi();
+  maintainNtp();
   checkForBetterAccessPoint();
+  logConsoleStatus();
   delay(250);
 }

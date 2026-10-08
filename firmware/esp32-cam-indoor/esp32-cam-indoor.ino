@@ -6,7 +6,7 @@
 
 #include "camera_pins.h"
 
-static const char *APP_VERSION = "0.4.0";
+static const char *APP_VERSION = "0.4.1";
 static const char *AP_PASSWORD = "esp32cam123";
 static const unsigned long WIFI_CONNECT_TIMEOUT_MS = 30000;
 static const unsigned long WIFI_RETRY_INTERVAL_MS = 30000;
@@ -468,7 +468,7 @@ static String configPage() {
   if (networkCount <= 0) {
     html += F("<p>Keine WLANs gefunden.</p>");
   } else {
-    html += F("<table><tr><th>SSID</th><th>Signal</th><th>Kanal</th><th>Sicherheit</th></tr>");
+    html += F("<table><tr><th>SSID</th><th>BSSID</th><th>Signal</th><th>Kanal</th><th>Sicherheit</th></tr>");
 
     for (int i = 0; i < networkCount; i++) {
       String scannedSsid = WiFi.SSID(i);
@@ -488,7 +488,9 @@ static String configPage() {
       } else {
         html += displaySsid;
       }
-      html += F("</td><td>");
+      html += F("</td><td><code>");
+      html += WiFi.BSSIDstr(i);
+      html += F("</code></td><td>");
       html += String(WiFi.RSSI(i));
       html += F(" dBm</td><td>");
       html += String(WiFi.channel(i));

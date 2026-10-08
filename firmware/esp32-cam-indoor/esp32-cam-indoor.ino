@@ -6,13 +6,13 @@
 
 #include "camera_pins.h"
 
-static const char *APP_VERSION = "0.6.2";
+static const char *APP_VERSION = "0.7.0";
 static const char *AP_PASSWORD = "esp32cam123";
 static const unsigned long WIFI_CONNECT_TIMEOUT_MS = 30000;
 static const unsigned long WIFI_RETRY_INTERVAL_MS = 30000;
 static const unsigned long WIFI_ROAM_CHECK_INTERVAL_MS = 60000;
-static const int WIFI_ROAM_TRIGGER_RSSI = -72;
-static const int WIFI_ROAM_MIN_IMPROVEMENT_DB = 4;
+static const int WIFI_ROAM_TRIGGER_RSSI_DEFAULT = -72;
+static const int WIFI_ROAM_MIN_IMPROVEMENT_DB_DEFAULT = 4;
 
 static httpd_handle_t http_server = nullptr;
 static httpd_handle_t stream_server = nullptr;
@@ -31,6 +31,8 @@ static unsigned long wifiRoamAttempts = 0;
 static unsigned long wifiRoamSuccesses = 0;
 static bool wifiRoamInProgress = false;
 static String wifiRoamTargetBssid;
+static int wifiRoamTriggerRssi = WIFI_ROAM_TRIGGER_RSSI_DEFAULT;
+static int wifiRoamMinImprovementDb = WIFI_ROAM_MIN_IMPROVEMENT_DB_DEFAULT;
 
 struct CameraSettings {
   framesize_t frameSize = FRAMESIZE_VGA;
@@ -154,6 +156,24 @@ static bool saveWifiConfig(const String &ssid, const String &password, bool upda
 
   prefs.end();
   return ok1 && ok2;
+}
+
+
+static void loadRoamingConfig() {
+  prefs.begin("roaming", true);
+  wifiRoamTriggerRssi = prefs.getInt("trigger_rssi", WIFI_ROAM_TRIGGER_RSSI_DEFAULT);
+  wifiRoamMinImprovementDb = prefs.getInt("min_improve_db", WIFI_ROAM_MIN_IMPROVEMENT_DB_DEFAULT);
+  prefs.end();
+
+  wifiRoamTriggerRssi = constrain(wifiRoamTriggerRssi, -95, -50);
+  wifiRoamMinImprovementDb = constrain(wifiRoamMinImprovementDb, 1, 20);
+}
+
+static void saveRoamingConfig() {
+  prefs.begin("roaming", false);
+  prefs.putInt("trigger_rssi", wifiRoamTriggerRssi);
+  prefs.putInt("min_improve_db", wifiRoamMinImprovementDb);
+  prefs.end();
 }
 
 static void loadCameraConfig() {
@@ -390,7 +410,7 @@ static void checkForBetterAccessPoint() {
   const int currentRssi = WiFi.RSSI();
 
   // Avoid scan interruptions while the current AP is already good enough.
-  if (currentRssi >= WIFI_ROAM_TRIGGER_RSSI) {
+  if (currentRssi >= wifiRoamTriggerRssi) {
     return;
   }
 
@@ -450,9 +470,9 @@ static void checkForBetterAccessPoint() {
                 bestRssi,
                 bestRssi - currentRssi);
 
-  if (bestRssi < currentRssi + WIFI_ROAM_MIN_IMPROVEMENT_DB) {
+  if (bestRssi < currentRssi + wifiRoamMinImprovementDb) {
     Serial.printf("Roam scan: improvement below %d dB threshold, staying on current AP\n",
-                  WIFI_ROAM_MIN_IMPROVEMENT_DB);
+                  wifiRoamMinImprovementDb);
     return;
   }
 
@@ -605,6 +625,19 @@ static String configPage() {
   html += String(wifiReconnectSuccesses);
   html += F("</td></tr>");
   html += F("</table></div>");
+
+  html += F("<div class='card'><h2>Roaming</h2>");
+  html += F("<form method='POST' action='/roaming/save'>");
+  html += F("<label>Roaming-Scan ab RSSI schlechter als (dBm)</label>");
+  html += F("<input type='number' min='-95' max='-50' name='trigger_rssi' value='");
+  html += String(wifiRoamTriggerRssi);
+  html += F("' required>");
+  html += F("<label>Mindestverbesserung für AP-Wechsel (dB)</label>");
+  html += F("<input type='number' min='1' max='20' name='min_improve_db' value='");
+  html += String(wifiRoamMinImprovementDb);
+  html += F("' required>");
+  html += F("<button type='submit'>Roaming speichern</button></form>");
+  html += F("<p><small>Standard: -72 dBm / 4 dB. Niedrigere dBm-Schwelle = später scannen; kleinere dB-Differenz = aggressiver wechseln.</small></p></div>");
 
   html += F("<div class='card'><h2>Gefundene WLANs</h2>");
   html += F("<p><small>ESP32-CAM unterstützt nur 2,4-GHz-WLAN. Netzwerk anklicken, dann Passwort eingeben.</small></p>");
@@ -802,6 +835,47 @@ static esp_err_t flash_off_handler(httpd_req_t *req) {
   return httpd_resp_send(req, nullptr, 0);
 }
 
+static esp_err_t roaming_save_handler(httpd_req_t *req) {
+  if (req->content_len <= 0 || req->content_len > 512) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid form data");
+    return ESP_FAIL;
+  }
+
+  String body;
+  body.reserve(req->content_len + 1);
+
+  int remaining = req->content_len;
+  char buffer[256];
+
+  while (remaining > 0) {
+    int received = httpd_req_recv(req, buffer, min(remaining, (int)sizeof(buffer)));
+    if (received <= 0) {
+      httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to read form data");
+      return ESP_FAIL;
+    }
+
+    body.concat(buffer, received);
+    remaining -= received;
+  }
+
+  int triggerRssi = formValue(body, "trigger_rssi").toInt();
+  int minImprovement = formValue(body, "min_improve_db").toInt();
+
+  if (triggerRssi < -95 || triggerRssi > -50 ||
+      minImprovement < 1 || minImprovement > 20) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Roaming values out of range");
+    return ESP_FAIL;
+  }
+
+  wifiRoamTriggerRssi = triggerRssi;
+  wifiRoamMinImprovementDb = minImprovement;
+  saveRoamingConfig();
+
+  httpd_resp_set_status(req, "303 See Other");
+  httpd_resp_set_hdr(req, "Location", "/config");
+  return httpd_resp_send(req, nullptr, 0);
+}
+
 static esp_err_t root_handler(httpd_req_t *req) {
   String html = rootPage();
   httpd_resp_set_type(req, "text/html; charset=utf-8");
@@ -935,6 +1009,10 @@ static esp_err_t status_handler(httpd_req_t *req) {
   body += String(wifiRoamAttempts);
   body += F(",\"roam_successes\":");
   body += String(wifiRoamSuccesses);
+  body += F(",\"roam_trigger_rssi\":");
+  body += String(wifiRoamTriggerRssi);
+  body += F(",\"roam_min_improvement_db\":");
+  body += String(wifiRoamMinImprovementDb);
   body += F(",\"roam_in_progress\":");
   body += wifiRoamInProgress ? "true" : "false";
   body += F(",\"roam_target_bssid\":\"");
@@ -1007,7 +1085,7 @@ static void startWebServers() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = 80;
   config.ctrl_port = 32768;
-  config.max_uri_handlers = 10;
+  config.max_uri_handlers = 12;
 
   if (httpd_start(&http_server, &config) == ESP_OK) {
     httpd_uri_t rootUri = {};
@@ -1063,6 +1141,12 @@ static void startWebServers() {
     flashOffUri.method = HTTP_POST;
     flashOffUri.handler = flash_off_handler;
     httpd_register_uri_handler(http_server, &flashOffUri);
+
+    httpd_uri_t roamingSaveUri = {};
+    roamingSaveUri.uri = "/roaming/save";
+    roamingSaveUri.method = HTTP_POST;
+    roamingSaveUri.handler = roaming_save_handler;
+    httpd_register_uri_handler(http_server, &roamingSaveUri);
   }
 
   httpd_config_t streamConfig = HTTPD_DEFAULT_CONFIG();
@@ -1132,6 +1216,7 @@ void setup() {
   Serial.println("================================");
 
   loadCameraConfig();
+  loadRoamingConfig();
 
   pinMode(FLASH_LED_GPIO_NUM, OUTPUT);
   setFlashLed(false);

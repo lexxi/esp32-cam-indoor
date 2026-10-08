@@ -6,7 +6,7 @@
 
 #include "camera_pins.h"
 
-static const char *APP_VERSION = "0.2.0";
+static const char *APP_VERSION = "0.3.0";
 static const char *AP_PASSWORD = "esp32cam123";
 static const unsigned long WIFI_CONNECT_TIMEOUT_MS = 30000;
 static const unsigned long WIFI_RETRY_INTERVAL_MS = 30000;
@@ -138,12 +138,10 @@ static bool saveWifiConfig(const String &ssid, const String &password, bool upda
 static void startAccessPoint() {
   apMode = true;
 
-  if (wifiSsid.length() > 0) {
-    WiFi.mode(WIFI_AP_STA);
-  } else {
-    WiFi.mode(WIFI_AP);
-  }
-
+  // Keep the station interface enabled even when no WLAN is configured.
+  // This is required so the configuration page can scan nearby networks
+  // while the fallback AP stays available.
+  WiFi.mode(WIFI_AP_STA);
   WiFi.setSleep(false);
 
   const String ssid = fallbackApSsid();
@@ -297,16 +295,22 @@ static String rootPage() {
 
 static String configPage() {
   const bool connected = WiFi.status() == WL_CONNECTED;
+
+  // Scan while keeping the fallback AP online. ESP32 is 2.4 GHz only.
+  // show_hidden=true makes hidden SSIDs visible as empty names.
+  int networkCount = WiFi.scanNetworks(false, true);
+
   String html;
-  html.reserve(5000);
+  html.reserve(9000);
 
   html += F("<!doctype html><html lang='de'><head><meta charset='utf-8'>");
   html += F("<meta name='viewport' content='width=device-width,initial-scale=1'>");
   html += F("<title>WLAN - ESP32-CAM Indoor</title>");
   html += F("<style>body{font-family:system-ui,sans-serif;max-width:820px;margin:30px auto;padding:0 18px;background:#f4f4f4;color:#222}");
   html += F(".card{background:#fff;padding:20px;margin-bottom:18px;border-radius:10px;box-shadow:0 1px 5px #bbb}");
-  html += F("input{width:100%;padding:10px;margin:6px 0 14px;box-sizing:border-box}button{padding:10px 18px;cursor:pointer}");
-  html += F("table{width:100%;border-collapse:collapse}td{padding:7px;border-bottom:1px solid #ddd}a{color:#06c}</style></head><body>");
+  html += F("input{width:100%;padding:10px;margin:6px 0 14px;box-sizing:border-box}button{padding:9px 14px;cursor:pointer}");
+  html += F("table{width:100%;border-collapse:collapse}td,th{padding:7px;border-bottom:1px solid #ddd;text-align:left}");
+  html += F(".ssidbtn{width:100%;text-align:left;background:#fff;border:1px solid #bbb;border-radius:5px}.muted{color:#666}a{color:#06c}</style></head><body>");
 
   html += F("<div class='card'><h1>WLAN</h1><table>");
   html += F("<tr><td>Status</td><td><b>");
@@ -321,7 +325,7 @@ static String configPage() {
 
   html += F("<tr><td>Betriebsart</td><td>");
   if (apMode && connected) html += F("STA + AP");
-  else if (apMode) html += F("Fallback AP");
+  else if (apMode) html += F("Fallback AP (AP + STA)");
   else html += F("STA");
   html += F("</td></tr>");
 
@@ -357,19 +361,61 @@ static String configPage() {
   html += F("<tr><td>Erfolgreiche Reconnects</td><td>");
   html += String(wifiReconnectSuccesses);
   html += F("</td></tr>");
-
   html += F("</table></div>");
 
-  html += F("<div class='card'><h2>WLAN-Konfiguration</h2>");
+  html += F("<div class='card'><h2>Gefundene WLANs</h2>");
+  html += F("<p><small>ESP32-CAM unterstützt nur 2,4-GHz-WLAN. Netzwerk anklicken, dann Passwort eingeben.</small></p>");
+
+  if (networkCount <= 0) {
+    html += F("<p>Keine WLANs gefunden.</p>");
+  } else {
+    html += F("<table><tr><th>SSID</th><th>Signal</th><th>Kanal</th><th>Sicherheit</th></tr>");
+
+    for (int i = 0; i < networkCount; i++) {
+      String scannedSsid = WiFi.SSID(i);
+      String displaySsid = scannedSsid.length() ? htmlEscape(scannedSsid) : String("<i>versteckt</i>");
+      bool openNetwork = WiFi.encryptionType(i) == WIFI_AUTH_OPEN;
+
+      html += F("<tr><td>");
+      if (scannedSsid.length()) {
+        html += F("<button type='button' class='ssidbtn' onclick=\"selectSsid('");
+        String jsSsid = scannedSsid;
+        jsSsid.replace("\\", "\\\\");
+        jsSsid.replace("'", "\\'");
+        html += jsSsid;
+        html += F("')\">");
+        html += displaySsid;
+        html += F("</button>");
+      } else {
+        html += displaySsid;
+      }
+      html += F("</td><td>");
+      html += String(WiFi.RSSI(i));
+      html += F(" dBm</td><td>");
+      html += String(WiFi.channel(i));
+      html += F("</td><td>");
+      html += openNetwork ? "offen" : "geschützt";
+      html += F("</td></tr>");
+    }
+
+    html += F("</table>");
+  }
+
+  html += F("<p><a href='/config'>Erneut scannen</a></p></div>");
+  WiFi.scanDelete();
+
+  html += F("<div class='card'><h2>WLAN verbinden</h2>");
   html += F("<form method='POST' action='/save'>");
-  html += F("<label>SSID</label><input name='ssid' value='");
+  html += F("<label>SSID</label><input id='ssid' name='ssid' value='");
   html += htmlEscape(wifiSsid);
   html += F("' required>");
   html += F("<label>Passwort</label>");
-  html += F("<input type='password' name='password' value='' placeholder='Leer lassen = bestehendes Passwort behalten'>");
-  html += F("<button type='submit'>Speichern und neu starten</button></form>");
-  html += F("<p><small>Das gespeicherte WLAN-Passwort wird nicht angezeigt.</small></p>");
-  html += F("<p><a href='/'>Zurück zur Kamera</a></p></div></body></html>");
+  html += F("<input type='password' name='password' value='' placeholder='Passwort eingeben'>");
+  html += F("<button type='submit'>Speichern und verbinden</button></form>");
+  html += F("<p><small>Bei derselben SSID bedeutet ein leeres Passwort: gespeichertes Passwort beibehalten. Bei einer neuen SSID wird ein leeres Passwort als offenes WLAN gespeichert.</small></p>");
+  html += F("<p><a href='/'>Zurück zur Kamera</a></p></div>");
+  html += F("<script>function selectSsid(s){document.getElementById('ssid').value=s;document.getElementById('ssid').scrollIntoView({behavior:'smooth',block:'center'});}</script>");
+  html += F("</body></html>");
 
   return html;
 }
@@ -418,7 +464,10 @@ static esp_err_t save_handler(httpd_req_t *req) {
     return ESP_FAIL;
   }
 
-  const bool updatePassword = newPassword.length() > 0 || wifiSsid.length() == 0;
+  // When selecting a different SSID, an empty password must mean
+  // "open network", not "reuse the password from the old WLAN".
+  const bool updatePassword =
+      newPassword.length() > 0 || wifiSsid.length() == 0 || newSsid != wifiSsid;
 
   if (!saveWifiConfig(newSsid, newPassword, updatePassword)) {
     httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Could not save Wi-Fi configuration");

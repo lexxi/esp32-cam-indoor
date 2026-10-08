@@ -6,7 +6,7 @@
 
 #include "camera_pins.h"
 
-static const char *APP_VERSION = "0.3.0";
+static const char *APP_VERSION = "0.4.0";
 static const char *AP_PASSWORD = "esp32cam123";
 static const unsigned long WIFI_CONNECT_TIMEOUT_MS = 30000;
 static const unsigned long WIFI_RETRY_INTERVAL_MS = 30000;
@@ -23,6 +23,18 @@ static unsigned long wifiLastRetryMillis = 0;
 static unsigned long wifiReconnectAttempts = 0;
 static unsigned long wifiReconnectSuccesses = 0;
 static unsigned long wifiLastConnectedMillis = 0;
+
+struct CameraSettings {
+  framesize_t frameSize = FRAMESIZE_VGA;
+  int jpegQuality = 12;
+  int brightness = 0;
+  int contrast = 0;
+  int saturation = 0;
+  bool vflip = false;
+  bool hmirror = false;
+};
+
+static CameraSettings cameraSettings;
 
 static const char *STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=frame";
 static const char *STREAM_BOUNDARY = "\r\n--frame\r\n";
@@ -133,6 +145,92 @@ static bool saveWifiConfig(const String &ssid, const String &password, bool upda
 
   prefs.end();
   return ok1 && ok2;
+}
+
+static void loadCameraConfig() {
+  prefs.begin("camera", true);
+  cameraSettings.frameSize = static_cast<framesize_t>(
+      prefs.getUChar("framesize", static_cast<uint8_t>(FRAMESIZE_VGA)));
+  cameraSettings.jpegQuality = prefs.getInt("quality", 12);
+  cameraSettings.brightness = prefs.getInt("brightness", 0);
+  cameraSettings.contrast = prefs.getInt("contrast", 0);
+  cameraSettings.saturation = prefs.getInt("saturation", 0);
+  cameraSettings.vflip = prefs.getBool("vflip", false);
+  cameraSettings.hmirror = prefs.getBool("hmirror", false);
+  prefs.end();
+
+  if (cameraSettings.jpegQuality < 4) cameraSettings.jpegQuality = 4;
+  if (cameraSettings.jpegQuality > 63) cameraSettings.jpegQuality = 63;
+  if (cameraSettings.brightness < -2) cameraSettings.brightness = -2;
+  if (cameraSettings.brightness > 2) cameraSettings.brightness = 2;
+  if (cameraSettings.contrast < -2) cameraSettings.contrast = -2;
+  if (cameraSettings.contrast > 2) cameraSettings.contrast = 2;
+  if (cameraSettings.saturation < -2) cameraSettings.saturation = -2;
+  if (cameraSettings.saturation > 2) cameraSettings.saturation = 2;
+}
+
+static bool saveCameraConfig() {
+  prefs.begin("camera", false);
+  prefs.putUChar("framesize", static_cast<uint8_t>(cameraSettings.frameSize));
+  prefs.putInt("quality", cameraSettings.jpegQuality);
+  prefs.putInt("brightness", cameraSettings.brightness);
+  prefs.putInt("contrast", cameraSettings.contrast);
+  prefs.putInt("saturation", cameraSettings.saturation);
+  prefs.putBool("vflip", cameraSettings.vflip);
+  prefs.putBool("hmirror", cameraSettings.hmirror);
+  prefs.end();
+  return true;
+}
+
+static void applyCameraSettings() {
+  sensor_t *sensor = esp_camera_sensor_get();
+  if (!sensor) return;
+
+  sensor->set_framesize(sensor, cameraSettings.frameSize);
+  sensor->set_quality(sensor, cameraSettings.jpegQuality);
+  sensor->set_brightness(sensor, cameraSettings.brightness);
+  sensor->set_contrast(sensor, cameraSettings.contrast);
+  sensor->set_saturation(sensor, cameraSettings.saturation);
+  sensor->set_vflip(sensor, cameraSettings.vflip ? 1 : 0);
+  sensor->set_hmirror(sensor, cameraSettings.hmirror ? 1 : 0);
+}
+
+static String frameSizeName(framesize_t size) {
+  switch (size) {
+    case FRAMESIZE_QQVGA: return "160x120";
+    case FRAMESIZE_QVGA: return "320x240";
+    case FRAMESIZE_CIF: return "400x296";
+    case FRAMESIZE_VGA: return "640x480";
+    case FRAMESIZE_SVGA: return "800x600";
+    case FRAMESIZE_XGA: return "1024x768";
+    case FRAMESIZE_SXGA: return "1280x1024";
+    case FRAMESIZE_UXGA: return "1600x1200";
+    default: return "640x480";
+  }
+}
+
+static framesize_t frameSizeFromValue(const String &value) {
+  if (value == "QQVGA") return FRAMESIZE_QQVGA;
+  if (value == "QVGA") return FRAMESIZE_QVGA;
+  if (value == "CIF") return FRAMESIZE_CIF;
+  if (value == "SVGA") return FRAMESIZE_SVGA;
+  if (value == "XGA") return FRAMESIZE_XGA;
+  if (value == "SXGA") return FRAMESIZE_SXGA;
+  if (value == "UXGA") return FRAMESIZE_UXGA;
+  return FRAMESIZE_VGA;
+}
+
+static String frameSizeValue(framesize_t size) {
+  switch (size) {
+    case FRAMESIZE_QQVGA: return "QQVGA";
+    case FRAMESIZE_QVGA: return "QVGA";
+    case FRAMESIZE_CIF: return "CIF";
+    case FRAMESIZE_SVGA: return "SVGA";
+    case FRAMESIZE_XGA: return "XGA";
+    case FRAMESIZE_SXGA: return "SXGA";
+    case FRAMESIZE_UXGA: return "UXGA";
+    default: return "VGA";
+  }
 }
 
 static void startAccessPoint() {
@@ -283,6 +381,7 @@ static String rootPage() {
 
   html += F("<div class='meta'><a href='/jpg'>Snapshot</a> · ");
   html += F("<a href='/status'>Status JSON</a> · ");
+  html += F("<a href='/camera'>Kamera-Settings</a> · ");
   html += F("<a href='/config'>WLAN-Konfiguration</a></div>");
 
   if (WiFi.status() == WL_CONNECTED) {
@@ -418,6 +517,129 @@ static String configPage() {
   html += F("</body></html>");
 
   return html;
+}
+
+static String cameraPage() {
+  String html;
+  html.reserve(6000);
+
+  html += F("<!doctype html><html lang='de'><head><meta charset='utf-8'>");
+  html += F("<meta name='viewport' content='width=device-width,initial-scale=1'>");
+  html += F("<title>Kamera - ESP32-CAM Indoor</title>");
+  html += F("<style>body{font-family:system-ui,sans-serif;max-width:820px;margin:30px auto;padding:0 18px;background:#f4f4f4;color:#222}");
+  html += F(".card{background:#fff;padding:20px;margin-bottom:18px;border-radius:10px;box-shadow:0 1px 5px #bbb}");
+  html += F("select,input{width:100%;padding:10px;margin:6px 0 14px;box-sizing:border-box}");
+  html += F("button{padding:10px 18px;cursor:pointer}label{font-weight:600}a{color:#06c}</style></head><body>");
+
+  html += F("<div class='card'><h1>Kamera-Settings</h1>");
+  html += F("<p>Firmware <b>v");
+  html += APP_VERSION;
+  html += F("</b></p>");
+  html += F("<form method='POST' action='/camera/save'>");
+
+  html += F("<label>Auflösung</label><select name='framesize'>");
+  const char *values[] = {"QQVGA","QVGA","CIF","VGA","SVGA","XGA","SXGA","UXGA"};
+  const char *labels[] = {"160x120","320x240","400x296","640x480","800x600","1024x768","1280x1024","1600x1200"};
+  String currentFrameSize = frameSizeValue(cameraSettings.frameSize);
+
+  for (size_t i = 0; i < 8; i++) {
+    html += F("<option value='");
+    html += values[i];
+    html += F("'");
+    if (currentFrameSize == values[i]) html += F(" selected");
+    html += F(">");
+    html += labels[i];
+    html += F("</option>");
+  }
+  html += F("</select>");
+
+  html += F("<label>JPEG Qualität (4 = beste Qualität, 63 = stärkste Kompression)</label>");
+  html += F("<input type='number' min='4' max='63' name='quality' value='");
+  html += String(cameraSettings.jpegQuality);
+  html += F("'>");
+
+  html += F("<label>Helligkeit (-2 bis 2)</label>");
+  html += F("<input type='number' min='-2' max='2' name='brightness' value='");
+  html += String(cameraSettings.brightness);
+  html += F("'>");
+
+  html += F("<label>Kontrast (-2 bis 2)</label>");
+  html += F("<input type='number' min='-2' max='2' name='contrast' value='");
+  html += String(cameraSettings.contrast);
+  html += F("'>");
+
+  html += F("<label>Sättigung (-2 bis 2)</label>");
+  html += F("<input type='number' min='-2' max='2' name='saturation' value='");
+  html += String(cameraSettings.saturation);
+  html += F("'>");
+
+  html += F("<label><input type='checkbox' name='vflip' value='1' style='width:auto'");
+  if (cameraSettings.vflip) html += F(" checked");
+  html += F("> Bild vertikal drehen</label><br>");
+
+  html += F("<label><input type='checkbox' name='hmirror' value='1' style='width:auto'");
+  if (cameraSettings.hmirror) html += F(" checked");
+  html += F("> Bild horizontal spiegeln</label><br><br>");
+
+  html += F("<button type='submit'>Speichern und anwenden</button></form>");
+  html += F("<p><small>Die Werte werden im NVS des ESP32 gespeichert und nach jedem Neustart wieder geladen.</small></p>");
+  html += F("<p><a href='/'>Zurück zur Kamera</a></p></div></body></html>");
+
+  return html;
+}
+
+static esp_err_t camera_handler(httpd_req_t *req) {
+  String html = cameraPage();
+  httpd_resp_set_type(req, "text/html; charset=utf-8");
+  return httpd_resp_send(req, html.c_str(), html.length());
+}
+
+static esp_err_t camera_save_handler(httpd_req_t *req) {
+  if (req->content_len <= 0 || req->content_len > 1024) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid form data");
+    return ESP_FAIL;
+  }
+
+  String body;
+  body.reserve(req->content_len + 1);
+
+  int remaining = req->content_len;
+  char buffer[256];
+
+  while (remaining > 0) {
+    int received = httpd_req_recv(req, buffer, min(remaining, (int)sizeof(buffer)));
+    if (received <= 0) {
+      httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to read form data");
+      return ESP_FAIL;
+    }
+
+    body.concat(buffer, received);
+    remaining -= received;
+  }
+
+  cameraSettings.frameSize = frameSizeFromValue(formValue(body, "framesize"));
+  cameraSettings.jpegQuality = constrain(formValue(body, "quality").toInt(), 4, 63);
+  cameraSettings.brightness = constrain(formValue(body, "brightness").toInt(), -2, 2);
+  cameraSettings.contrast = constrain(formValue(body, "contrast").toInt(), -2, 2);
+  cameraSettings.saturation = constrain(formValue(body, "saturation").toInt(), -2, 2);
+  cameraSettings.vflip = formValue(body, "vflip") == "1";
+  cameraSettings.hmirror = formValue(body, "hmirror") == "1";
+
+  saveCameraConfig();
+  applyCameraSettings();
+
+  String response;
+  response.reserve(1200);
+  response += F("<!doctype html><html lang='de'><head><meta charset='utf-8'>");
+  response += F("<meta name='viewport' content='width=device-width,initial-scale=1'>");
+  response += F("<title>Kamera gespeichert</title></head><body>");
+  response += F("<h1>Kamera-Settings gespeichert</h1>");
+  response += F("<p>Die Einstellungen wurden im ESP32 gespeichert und sofort angewendet.</p>");
+  response += F("<p><a href='/camera'>Zurück zu den Kamera-Settings</a> · <a href='/'>Zum Stream</a></p>");
+  response += F("</body></html>");
+
+  httpd_resp_set_type(req, "text/html; charset=utf-8");
+  return httpd_resp_send(req, response.c_str(), response.length());
 }
 
 static esp_err_t root_handler(httpd_req_t *req) {
@@ -582,6 +804,18 @@ static void startWebServers() {
     rootUri.handler = root_handler;
     httpd_register_uri_handler(http_server, &rootUri);
 
+    httpd_uri_t cameraUri = {};
+    cameraUri.uri = "/camera";
+    cameraUri.method = HTTP_GET;
+    cameraUri.handler = camera_handler;
+    httpd_register_uri_handler(http_server, &cameraUri);
+
+    httpd_uri_t cameraSaveUri = {};
+    cameraSaveUri.uri = "/camera/save";
+    cameraSaveUri.method = HTTP_POST;
+    cameraSaveUri.handler = camera_save_handler;
+    httpd_register_uri_handler(http_server, &cameraSaveUri);
+
     httpd_uri_t configUri = {};
     configUri.uri = "/config";
     configUri.method = HTTP_GET;
@@ -646,8 +880,8 @@ static bool initCamera() {
 
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size = FRAMESIZE_VGA;
-  config.jpeg_quality = 12;
+  config.frame_size = cameraSettings.frameSize;
+  config.jpeg_quality = cameraSettings.jpegQuality;
   config.fb_count = psramFound() ? 2 : 1;
   config.grab_mode = CAMERA_GRAB_LATEST;
   config.fb_location = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
@@ -659,9 +893,7 @@ static bool initCamera() {
     return false;
   }
 
-  sensor_t *sensor = esp_camera_sensor_get();
-  if (sensor) sensor->set_framesize(sensor, FRAMESIZE_VGA);
-
+  applyCameraSettings();
   return true;
 }
 
@@ -671,6 +903,8 @@ void setup() {
 
   Serial.println();
   Serial.printf("ESP32-CAM Indoor v%s starting...\n", APP_VERSION);
+
+  loadCameraConfig();
 
   if (!initCamera()) {
     delay(3000);

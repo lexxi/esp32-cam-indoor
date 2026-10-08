@@ -174,3 +174,18 @@ stability can be compared cleanly with the v0.7.x firmware.
 NTP/time support has been removed again for a clean A/B comparison with the
 known-smooth v0.7.x stream behavior. Camera, roaming, flash LED, Wi-Fi settings
 and diagnostics remain unchanged.
+
+
+## v0.8.3 resolution-aware framebuffer policy
+
+To reduce `cam_hal: FB-OVF` errors at larger resolutions, the camera now uses
+different buffering modes depending on resolution:
+
+- QQVGA through VGA: 2 framebuffers with `CAMERA_GRAB_LATEST` for smoother,
+  lower-latency streaming.
+- SVGA through UXGA: 1 framebuffer with `CAMERA_GRAB_WHEN_EMPTY` for improved
+  stability at larger frame sizes.
+
+When changing between these two resolution classes, the camera restarts once so
+the framebuffer allocation is recreated with the correct policy. Changes within
+the same class are still applied immediately.

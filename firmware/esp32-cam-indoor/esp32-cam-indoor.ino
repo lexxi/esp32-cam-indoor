@@ -6,7 +6,7 @@
 
 #include "camera_pins.h"
 
-static const char *APP_VERSION = "0.8.2";
+static const char *APP_VERSION = "0.8.3";
 static const char *AP_PASSWORD = "esp32cam123";
 static const unsigned long WIFI_CONNECT_TIMEOUT_MS = 30000;
 static const unsigned long WIFI_RETRY_INTERVAL_MS = 30000;
@@ -248,6 +248,10 @@ static framesize_t frameSizeFromValue(const String &value) {
   if (value == "SXGA") return FRAMESIZE_SXGA;
   if (value == "UXGA") return FRAMESIZE_UXGA;
   return FRAMESIZE_VGA;
+}
+
+static bool isHighResolution(framesize_t size) {
+  return size > FRAMESIZE_VGA;
 }
 
 static void setFlashLed(bool on) {
@@ -733,6 +737,7 @@ static String cameraPage() {
     html += F("</option>");
   }
   html += F("</select>");
+  html += F("<p><small>Bis VGA: flüssiger Stream mit 2 Framebuffern. Ab SVGA: stabiler High-Resolution-Modus mit 1 Framebuffer. Beim Wechsel zwischen den Bereichen erfolgt ein Neustart.</small></p>");
 
   html += F("<label>JPEG Qualität (4 = beste Qualität, 63 = stärkste Kompression)</label>");
   html += F("<input type='number' min='4' max='63' name='quality' value='");
@@ -798,6 +803,8 @@ static esp_err_t camera_save_handler(httpd_req_t *req) {
     remaining -= received;
   }
 
+  const bool wasHighResolution = isHighResolution(cameraSettings.frameSize);
+
   cameraSettings.frameSize = frameSizeFromValue(formValue(body, "framesize"));
   cameraSettings.jpegQuality = constrain(formValue(body, "quality").toInt(), 4, 63);
   cameraSettings.brightness = constrain(formValue(body, "brightness").toInt(), -2, 2);
@@ -807,20 +814,40 @@ static esp_err_t camera_save_handler(httpd_req_t *req) {
   cameraSettings.hmirror = formValue(body, "hmirror") == "1";
 
   saveCameraConfig();
-  applyCameraSettings();
+
+  const bool isNowHighResolution = isHighResolution(cameraSettings.frameSize);
+  const bool bufferingModeChanged = wasHighResolution != isNowHighResolution;
+
+  if (!bufferingModeChanged) {
+    applyCameraSettings();
+  }
 
   String response;
-  response.reserve(1200);
+  response.reserve(1400);
   response += F("<!doctype html><html lang='de'><head><meta charset='utf-8'>");
   response += F("<meta name='viewport' content='width=device-width,initial-scale=1'>");
+  if (bufferingModeChanged) {
+    response += F("<meta http-equiv='refresh' content='6;url=/'>");
+  }
   response += F("<title>Kamera gespeichert</title></head><body>");
   response += F("<h1>Kamera-Settings gespeichert</h1>");
-  response += F("<p>Die Einstellungen wurden im ESP32 gespeichert und sofort angewendet.</p>");
+  if (bufferingModeChanged) {
+    response += F("<p>Framebuffer-Modus wird angepasst. Die Kamera startet einmal neu...</p>");
+  } else {
+    response += F("<p>Die Einstellungen wurden im ESP32 gespeichert und sofort angewendet.</p>");
+  }
   response += F("<p><a href='/camera'>Zurück zu den Kamera-Settings</a> · <a href='/'>Zum Stream</a></p>");
   response += F("</body></html>");
 
   httpd_resp_set_type(req, "text/html; charset=utf-8");
-  return httpd_resp_send(req, response.c_str(), response.length());
+  esp_err_t result = httpd_resp_send(req, response.c_str(), response.length());
+
+  if (bufferingModeChanged) {
+    delay(1000);
+    ESP.restart();
+  }
+
+  return result;
 }
 
 static esp_err_t flash_on_handler(httpd_req_t *req) {
@@ -1195,9 +1222,23 @@ static bool initCamera() {
   config.pixel_format = PIXFORMAT_JPEG;
   config.frame_size = cameraSettings.frameSize;
   config.jpeg_quality = cameraSettings.jpegQuality;
-  config.fb_count = psramFound() ? 2 : 1;
-  config.grab_mode = CAMERA_GRAB_LATEST;
-  config.fb_location = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
+
+  const bool highResolution = isHighResolution(cameraSettings.frameSize);
+
+  if (psramFound()) {
+    config.fb_count = highResolution ? 1 : 2;
+    config.fb_location = CAMERA_FB_IN_PSRAM;
+  } else {
+    config.fb_count = 1;
+    config.fb_location = CAMERA_FB_IN_DRAM;
+  }
+
+  config.grab_mode =
+      highResolution ? CAMERA_GRAB_WHEN_EMPTY : CAMERA_GRAB_LATEST;
+
+  Serial.printf("Camera buffering: %s, fb_count=%d\n",
+                highResolution ? "stable high-resolution" : "low-latency stream",
+                config.fb_count);
 
   esp_err_t err = esp_camera_init(&config);
 

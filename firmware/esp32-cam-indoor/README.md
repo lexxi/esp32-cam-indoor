@@ -123,3 +123,21 @@ This hysteresis avoids unnecessary switching between access points with nearly
 identical signal levels.
 
 - Firmware v0.6.2 also logs the best roam candidate BSSID and its RSSI, even when the threshold is not met.
+
+
+## Configurable roaming thresholds
+
+Firmware v0.7.0 stores the roaming thresholds in NVS and exposes them on the
+WLAN configuration page.
+
+Defaults:
+
+- Start roam scan below: -72 dBm
+- Minimum improvement before switching AP: 4 dB
+
+Allowed ranges:
+
+- Trigger RSSI: -95 to -50 dBm
+- Minimum improvement: 1 to 20 dB
+
+The current values are also included in `/status`.

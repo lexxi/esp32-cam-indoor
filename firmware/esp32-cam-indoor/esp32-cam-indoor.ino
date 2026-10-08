@@ -3,10 +3,13 @@
 #include <Preferences.h>
 #include "esp_camera.h"
 #include "esp_http_server.h"
+#include "img_converters.h"
+#include "esp_heap_caps.h"
+#include <time.h>
 
 #include "camera_pins.h"
 
-static const char *APP_VERSION = "0.7.0";
+static const char *APP_VERSION = "0.8.0";
 static const char *AP_PASSWORD = "esp32cam123";
 static const unsigned long WIFI_CONNECT_TIMEOUT_MS = 30000;
 static const unsigned long WIFI_RETRY_INTERVAL_MS = 30000;
@@ -42,6 +45,7 @@ struct CameraSettings {
   int saturation = 0;
   bool vflip = false;
   bool hmirror = false;
+  bool timestamp = false;
 };
 
 static CameraSettings cameraSettings;
@@ -135,6 +139,43 @@ static const char *wifiSignalRating(int32_t rssi) {
   return "schlecht";
 }
 
+
+static bool timeIsSynchronized() {
+  return time(nullptr) >= 1700000000;
+}
+
+static String currentLocalTime() {
+  if (!timeIsSynchronized()) return "";
+
+  time_t now = time(nullptr);
+  struct tm tmNow;
+  localtime_r(&now, &tmNow);
+
+  char buffer[24];
+  strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &tmNow);
+  return String(buffer);
+}
+
+static void syncClock() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  // Austria: CET/CEST with automatic daylight-saving transition.
+  configTzTime("CET-1CEST,M3.5.0,M10.5.0",
+               "pool.ntp.org",
+               "time.nist.gov");
+
+  unsigned long started = millis();
+  while (!timeIsSynchronized() && millis() - started < 5000) {
+    delay(100);
+  }
+
+  if (timeIsSynchronized()) {
+    Serial.printf("NTP time synchronized: %s\n", currentLocalTime().c_str());
+  } else {
+    Serial.println("NTP synchronization unavailable");
+  }
+}
+
 static bool loadWifiConfig() {
   prefs.begin("wifi", true);
   wifiSsid = prefs.getString("ssid", "");
@@ -186,6 +227,7 @@ static void loadCameraConfig() {
   cameraSettings.saturation = prefs.getInt("saturation", 0);
   cameraSettings.vflip = prefs.getBool("vflip", false);
   cameraSettings.hmirror = prefs.getBool("hmirror", false);
+  cameraSettings.timestamp = prefs.getBool("timestamp", false);
   prefs.end();
 
   if (cameraSettings.jpegQuality < 4) cameraSettings.jpegQuality = 4;
@@ -207,6 +249,7 @@ static bool saveCameraConfig() {
   prefs.putInt("saturation", cameraSettings.saturation);
   prefs.putBool("vflip", cameraSettings.vflip);
   prefs.putBool("hmirror", cameraSettings.hmirror);
+  prefs.putBool("timestamp", cameraSettings.timestamp);
   prefs.end();
   return true;
 }
@@ -345,6 +388,7 @@ static void maintainWifi() {
       }
 
       wifiLastConnectedMillis = millis();
+      syncClock();
       Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
       Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
 
@@ -502,6 +546,122 @@ static void checkForBetterAccessPoint() {
       bestChannel,
       bestBssid,
       true);
+}
+
+
+struct Glyph5x7 {
+  char c;
+  uint8_t rows[7];
+};
+
+static const Glyph5x7 TIMESTAMP_FONT[] = {
+  {'0',{0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}},
+  {'1',{0x04,0x0C,0x04,0x04,0x04,0x04,0x0E}},
+  {'2',{0x0E,0x11,0x01,0x02,0x04,0x08,0x1F}},
+  {'3',{0x1E,0x01,0x01,0x0E,0x01,0x01,0x1E}},
+  {'4',{0x02,0x06,0x0A,0x12,0x1F,0x02,0x02}},
+  {'5',{0x1F,0x10,0x10,0x1E,0x01,0x01,0x1E}},
+  {'6',{0x0E,0x10,0x10,0x1E,0x11,0x11,0x0E}},
+  {'7',{0x1F,0x01,0x02,0x04,0x08,0x08,0x08}},
+  {'8',{0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}},
+  {'9',{0x0E,0x11,0x11,0x0F,0x01,0x01,0x0E}},
+  {'-',{0x00,0x00,0x00,0x1F,0x00,0x00,0x00}},
+  {':',{0x00,0x04,0x04,0x00,0x04,0x04,0x00}},
+  {' ',{0x00,0x00,0x00,0x00,0x00,0x00,0x00}}
+};
+
+static const uint8_t *glyphFor(char c) {
+  for (size_t i = 0; i < sizeof(TIMESTAMP_FONT) / sizeof(TIMESTAMP_FONT[0]); i++) {
+    if (TIMESTAMP_FONT[i].c == c) return TIMESTAMP_FONT[i].rows;
+  }
+  return nullptr;
+}
+
+static void setRgbPixel(uint8_t *rgb, int width, int height,
+                        int x, int y, uint8_t r, uint8_t g, uint8_t b) {
+  if (x < 0 || y < 0 || x >= width || y >= height) return;
+  size_t offset = (static_cast<size_t>(y) * width + x) * 3;
+  rgb[offset] = r;
+  rgb[offset + 1] = g;
+  rgb[offset + 2] = b;
+}
+
+static void drawTimestampText(uint8_t *rgb, int width, int height, const String &text) {
+  const int scale = width >= 800 ? 3 : 2;
+  const int charWidth = 6 * scale;
+  const int textWidth = text.length() * charWidth;
+  const int textHeight = 7 * scale;
+  const int margin = 8;
+  const int x0 = margin;
+  const int y0 = max(margin, height - textHeight - margin);
+
+  // Black background for readability.
+  for (int y = y0 - 4; y < y0 + textHeight + 4; y++) {
+    for (int x = x0 - 4; x < min(width, x0 + textWidth + 4); x++) {
+      setRgbPixel(rgb, width, height, x, y, 0, 0, 0);
+    }
+  }
+
+  int cursorX = x0;
+  for (size_t i = 0; i < text.length(); i++) {
+    const uint8_t *glyph = glyphFor(text[i]);
+    if (!glyph) {
+      cursorX += charWidth;
+      continue;
+    }
+
+    for (int row = 0; row < 7; row++) {
+      for (int col = 0; col < 5; col++) {
+        if ((glyph[row] >> (4 - col)) & 0x01) {
+          for (int sy = 0; sy < scale; sy++) {
+            for (int sx = 0; sx < scale; sx++) {
+              setRgbPixel(rgb, width, height,
+                          cursorX + col * scale + sx,
+                          y0 + row * scale + sy,
+                          255, 255, 255);
+            }
+          }
+        }
+      }
+    }
+    cursorX += charWidth;
+  }
+}
+
+static bool makeTimestampedJpeg(camera_fb_t *fb, uint8_t **outJpg, size_t *outLen) {
+  if (!fb || !outJpg || !outLen || !timeIsSynchronized()) return false;
+
+  const size_t rgbLen = static_cast<size_t>(fb->width) * fb->height * 3;
+  uint8_t *rgb = static_cast<uint8_t *>(
+      heap_caps_malloc(rgbLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+
+  if (!rgb) {
+    Serial.printf("Timestamp: RGB buffer allocation failed (%u bytes)\n",
+                  static_cast<unsigned>(rgbLen));
+    return false;
+  }
+
+  if (!fmt2rgb888(fb->buf, fb->len, fb->format, rgb)) {
+    Serial.println("Timestamp: JPEG decode failed");
+    free(rgb);
+    return false;
+  }
+
+  drawTimestampText(rgb, fb->width, fb->height, currentLocalTime());
+
+  bool ok = fmt2jpg(rgb,
+                    rgbLen,
+                    fb->width,
+                    fb->height,
+                    PIXFORMAT_RGB888,
+                    cameraSettings.jpegQuality,
+                    outJpg,
+                    outLen);
+
+  free(rgb);
+
+  if (!ok) Serial.println("Timestamp: JPEG encode failed");
+  return ok;
 }
 
 static String rootPage() {
@@ -760,6 +920,10 @@ static String cameraPage() {
   if (cameraSettings.hmirror) html += F(" checked");
   html += F("> Bild horizontal spiegeln</label><br><br>");
 
+  html += F("<label><input type='checkbox' name='timestamp' value='1' style='width:auto'");
+  if (cameraSettings.timestamp) html += F(" checked");
+  html += F("> Zeitstempel in JPG-Snapshots einblenden</label><br><br>");
+
   html += F("<button type='submit'>Speichern und anwenden</button></form>");
   html += F("<p><small>Die Werte werden im NVS des ESP32 gespeichert und nach jedem Neustart wieder geladen.</small></p>");
   html += F("<p><a href='/'>Zurück zur Kamera</a></p></div></body></html>");
@@ -803,6 +967,7 @@ static esp_err_t camera_save_handler(httpd_req_t *req) {
   cameraSettings.saturation = constrain(formValue(body, "saturation").toInt(), -2, 2);
   cameraSettings.vflip = formValue(body, "vflip") == "1";
   cameraSettings.hmirror = formValue(body, "hmirror") == "1";
+  cameraSettings.timestamp = formValue(body, "timestamp") == "1";
 
   saveCameraConfig();
   applyCameraSettings();
@@ -961,7 +1126,25 @@ static esp_err_t jpg_handler(httpd_req_t *req) {
 
   httpd_resp_set_type(req, "image/jpeg");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-  esp_err_t result = httpd_resp_send(req, reinterpret_cast<const char *>(fb->buf), fb->len);
+
+  uint8_t *timestampedJpg = nullptr;
+  size_t timestampedLen = 0;
+  esp_err_t result;
+
+  if (cameraSettings.timestamp &&
+      makeTimestampedJpeg(fb, &timestampedJpg, &timestampedLen)) {
+    result = httpd_resp_send(
+        req,
+        reinterpret_cast<const char *>(timestampedJpg),
+        timestampedLen);
+    free(timestampedJpg);
+  } else {
+    result = httpd_resp_send(
+        req,
+        reinterpret_cast<const char *>(fb->buf),
+        fb->len);
+  }
+
   esp_camera_fb_return(fb);
   return result;
 }
@@ -991,6 +1174,11 @@ static esp_err_t status_handler(httpd_req_t *req) {
   body += String(millis() / 1000UL);
   body += F(",\"free_heap\":");
   body += String(ESP.getFreeHeap());
+  body += F(",\"time_synchronized\":");
+  body += timeIsSynchronized() ? "true" : "false";
+  body += F(",\"local_time\":\"");
+  body += currentLocalTime();
+  body += F("\"");
   body += F(",\"psram\":");
   body += psramFound() ? "true" : "false";
   body += F(",\"psram_size\":");
@@ -1039,6 +1227,8 @@ static esp_err_t status_handler(httpd_req_t *req) {
   body += cameraSettings.hmirror ? "true" : "false";
   body += F(",\"flash_led\":");
   body += flashLedOn ? "true" : "false";
+  body += F(",\"timestamp\":");
+  body += cameraSettings.timestamp ? "true" : "false";
   body += F("}}");
 
   httpd_resp_set_type(req, "application/json");
@@ -1228,6 +1418,8 @@ void setup() {
 
   if (!connectWifi()) {
     startAccessPoint();
+  } else {
+    syncClock();
   }
 
   startWebServers();

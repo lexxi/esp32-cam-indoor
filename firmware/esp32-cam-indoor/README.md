@@ -141,3 +141,21 @@ Allowed ranges:
 - Minimum improvement: 1 to 20 dB
 
 The current values are also included in `/status`.
+
+
+## NTP and snapshot timestamps
+
+Firmware v0.8.0 adds local time synchronization using the same CET/CEST setup as
+the MGE UPS controller:
+
+- NTP servers: `pool.ntp.org`, `time.nist.gov`
+- Time zone: Austria / Central Europe with automatic daylight-saving time
+- Current synchronization state and local time are shown in `/status`
+- NTP is synchronized after the initial Wi-Fi connection and after reconnects
+
+A new camera setting can optionally burn a timestamp into `/jpg` snapshots.
+The live MJPEG stream is intentionally left untouched.
+
+Timestamp rendering requires decoding and re-encoding the JPEG. If the required
+PSRAM buffer cannot be allocated at a large resolution, the firmware safely
+falls back to returning the original snapshot without an overlay.

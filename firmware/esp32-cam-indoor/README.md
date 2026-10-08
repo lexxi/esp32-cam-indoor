@@ -227,3 +227,14 @@ USB serial connection is no longer required for normal diagnostics.
 Low-level ESP-IDF/camera-driver messages that are emitted directly by the
 framework (for example some `cam_hal` diagnostics) are not guaranteed to pass
 through the application logger.
+
+
+## v0.8.8 RSSI range tracking and camera init retry
+
+- Tracks minimum and maximum Wi-Fi RSSI since boot.
+- The 60-second firmware heartbeat now includes current RSSI plus min/max values.
+- `/status` exposes `rssi_min` and `rssi_max`.
+- Camera startup now retries initialization up to three times.
+- Between failed attempts, the OV2640 sensor is power-cycled through the PWDN pin.
+- A partial camera-driver state is deinitialized before retrying.
+- If all three attempts fail, the existing ESP restart fallback remains in place.

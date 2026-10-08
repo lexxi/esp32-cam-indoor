@@ -159,3 +159,11 @@ The live MJPEG stream is intentionally left untouched.
 Timestamp rendering requires decoding and re-encoding the JPEG. If the required
 PSRAM buffer cannot be allocated at a large resolution, the firmware safely
 falls back to returning the original snapshot without an overlay.
+
+
+## v0.8.1 stability test
+
+The NTP synchronization and local time reporting remain enabled, but the
+experimental JPG timestamp overlay has been removed again. This returns
+snapshot handling to the direct JPEG path used before v0.8.0 so stream
+stability can be compared cleanly with the v0.7.x firmware.

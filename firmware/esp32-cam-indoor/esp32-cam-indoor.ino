@@ -9,7 +9,7 @@
 
 #include "camera_pins.h"
 
-static const char *APP_VERSION = "0.8.7";
+static const char *APP_VERSION = "0.8.8";
 static const char *AP_PASSWORD = "esp32cam123";
 static const unsigned long WIFI_CONNECT_TIMEOUT_MS = 30000;
 static const unsigned long WIFI_RETRY_INTERVAL_MS = 30000;
@@ -45,6 +45,9 @@ static int wifiRoamMinImprovementDb = WIFI_ROAM_MIN_IMPROVEMENT_DB_DEFAULT;
 static bool ntpStarted = false;
 static bool ntpLoggedSynchronized = false;
 static unsigned long consoleLastStatusMillis = 0;
+static bool wifiRssiSeen = false;
+static int wifiRssiMin = 0;
+static int wifiRssiMax = 0;
 
 struct CameraSettings {
   framesize_t frameSize = FRAMESIZE_VGA;
@@ -319,6 +322,22 @@ static void maintainNtp() {
   }
 }
 
+static void updateRssiStats() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  const int rssi = WiFi.RSSI();
+
+  if (!wifiRssiSeen) {
+    wifiRssiMin = rssi;
+    wifiRssiMax = rssi;
+    wifiRssiSeen = true;
+    return;
+  }
+
+  if (rssi < wifiRssiMin) wifiRssiMin = rssi;
+  if (rssi > wifiRssiMax) wifiRssiMax = rssi;
+}
+
 static void logConsoleStatus() {
   if (millis() - consoleLastStatusMillis < CONSOLE_STATUS_INTERVAL_MS) return;
   consoleLastStatusMillis = millis();
@@ -326,9 +345,12 @@ static void logConsoleStatus() {
   logPrintf("[FW %s] uptime=%lus", APP_VERSION, millis() / 1000UL);
 
   if (WiFi.status() == WL_CONNECTED) {
-    logPrintf(" wifi=%s rssi=%d bssid=%s",
+    updateRssiStats();
+    logPrintf(" wifi=%s rssi=%d min=%d max=%d bssid=%s",
                   WiFi.localIP().toString().c_str(),
                   WiFi.RSSI(),
+                  wifiRssiSeen ? wifiRssiMin : 0,
+                  wifiRssiSeen ? wifiRssiMax : 0,
                   WiFi.BSSIDstr().c_str());
   } else {
     logPrint(" wifi=disconnected");
@@ -537,6 +559,7 @@ static bool connectWifi() {
     wifiLastConnectedMillis = millis();
 
     logPrintln("Wi-Fi connected");
+    updateRssiStats();
     startNtpSync();
     logPrintf("IP: %s\n", WiFi.localIP().toString().c_str());
     logPrintf("RSSI: %d dBm\n", WiFi.RSSI());
@@ -551,6 +574,8 @@ static void maintainWifi() {
   const bool connected = (WiFi.status() == WL_CONNECTED);
 
   if (connected) {
+    updateRssiStats();
+
     if (!wifiWasConnected) {
       wifiWasConnected = true;
       if (wifiRoamInProgress) {
@@ -1384,6 +1409,10 @@ static esp_err_t status_handler(httpd_req_t *req) {
   body += wifiSsid;
   body += F("\",\"rssi\":");
   body += WiFi.status() == WL_CONNECTED ? String(WiFi.RSSI()) : String("null");
+  body += F(",\"rssi_min\":");
+  body += wifiRssiSeen ? String(wifiRssiMin) : String("null");
+  body += F(",\"rssi_max\":");
+  body += wifiRssiSeen ? String(wifiRssiMax) : String("null");
   body += F(",\"ip\":\"");
   body += WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String("");
   body += F("\",\"ap_ip\":\"");
@@ -1587,7 +1616,7 @@ static void startWebServers() {
   }
 }
 
-static bool initCamera() {
+static bool initCameraOnce() {
   camera_config_t config = {};
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -1629,10 +1658,10 @@ static bool initCamera() {
       highResolution ? CAMERA_GRAB_WHEN_EMPTY : CAMERA_GRAB_LATEST;
 
   logPrintf("Camera buffering: %s, fb_count=%d\n",
-                highResolution ? "stable high-resolution" : "low-latency stream",
-                config.fb_count);
+            highResolution ? "stable high-resolution" : "low-latency stream",
+            config.fb_count);
 
-  esp_err_t err = esp_camera_init(&config);
+  const esp_err_t err = esp_camera_init(&config);
 
   if (err != ESP_OK) {
     logPrintf("Camera init failed: 0x%x\n", err);
@@ -1641,6 +1670,44 @@ static bool initCamera() {
 
   applyCameraSettings();
   return true;
+}
+
+static void powerCycleCamera() {
+#if PWDN_GPIO_NUM >= 0
+  pinMode(PWDN_GPIO_NUM, OUTPUT);
+  digitalWrite(PWDN_GPIO_NUM, HIGH);
+  delay(250);
+  digitalWrite(PWDN_GPIO_NUM, LOW);
+  delay(500);
+#else
+  delay(750);
+#endif
+}
+
+static bool initCamera() {
+  static const int CAMERA_INIT_ATTEMPTS = 3;
+
+  for (int attempt = 1; attempt <= CAMERA_INIT_ATTEMPTS; attempt++) {
+    logPrintf("Camera init attempt %d/%d\n", attempt, CAMERA_INIT_ATTEMPTS);
+
+    if (initCameraOnce()) {
+      if (attempt > 1) {
+        logPrintf("Camera init recovered on attempt %d\n", attempt);
+      }
+      return true;
+    }
+
+    // Clean up any partial driver state before retrying.
+    esp_camera_deinit();
+
+    if (attempt < CAMERA_INIT_ATTEMPTS) {
+      logPrintln("Camera init retry after sensor power-cycle");
+      powerCycleCamera();
+    }
+  }
+
+  logPrintln("Camera init failed after 3 attempts");
+  return false;
 }
 
 void setup() {

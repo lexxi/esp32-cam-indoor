@@ -6,13 +6,13 @@
 
 #include "camera_pins.h"
 
-static const char *APP_VERSION = "0.6.1";
+static const char *APP_VERSION = "0.6.2";
 static const char *AP_PASSWORD = "esp32cam123";
 static const unsigned long WIFI_CONNECT_TIMEOUT_MS = 30000;
 static const unsigned long WIFI_RETRY_INTERVAL_MS = 30000;
 static const unsigned long WIFI_ROAM_CHECK_INTERVAL_MS = 60000;
 static const int WIFI_ROAM_TRIGGER_RSSI = -72;
-static const int WIFI_ROAM_MIN_IMPROVEMENT_DB = 6;
+static const int WIFI_ROAM_MIN_IMPROVEMENT_DB = 4;
 
 static httpd_handle_t http_server = nullptr;
 static httpd_handle_t stream_server = nullptr;
@@ -440,10 +440,19 @@ static void checkForBetterAccessPoint() {
 
   WiFi.scanDelete();
 
-  if (!betterApFound ||
-      bestRssi < currentRssi + WIFI_ROAM_MIN_IMPROVEMENT_DB) {
-    Serial.printf("Roam scan: no sufficiently better AP found (best %d dBm)\n",
-                  bestRssi);
+  if (!betterApFound) {
+    Serial.println("Roam scan: no other AP with the configured SSID found");
+    return;
+  }
+
+  Serial.printf("Roam scan: best candidate %s at %d dBm (%+d dB)\n",
+                bestBssidString.c_str(),
+                bestRssi,
+                bestRssi - currentRssi);
+
+  if (bestRssi < currentRssi + WIFI_ROAM_MIN_IMPROVEMENT_DB) {
+    Serial.printf("Roam scan: improvement below %d dB threshold, staying on current AP\n",
+                  WIFI_ROAM_MIN_IMPROVEMENT_DB);
     return;
   }
 

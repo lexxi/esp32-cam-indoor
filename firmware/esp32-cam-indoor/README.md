@@ -12,6 +12,7 @@ Arduino firmware for the AI-Thinker style ESP32-CAM + OV2640.
 - Persistent Wi-Fi configuration in ESP32 NVS
 - 30 second initial Wi-Fi connection timeout
 - Automatic fallback access point if Wi-Fi is missing or unavailable
+- RSSI-based roaming between access points that broadcast the same SSID
 - Background Wi-Fi retry every 30 seconds while the fallback AP is active
 - Fallback AP shuts down automatically after the configured Wi-Fi reconnects
 - Wi-Fi configuration page with RSSI, BSSID, channel and reconnect counters
@@ -104,3 +105,19 @@ The `/status` endpoint includes:
 - flash LED state
 
 The flash LED uses GPIO 4 on the AI-Thinker ESP32-CAM. It is deliberately OFF after every reboot.
+
+
+## Wi-Fi roaming
+
+Firmware v0.6.0 adds simple client-side roaming for installations with multiple
+access points using the same SSID.
+
+- Roam check interval: 60 seconds
+- A roam scan is only started when the current RSSI is below -72 dBm
+- A different BSSID must be at least 6 dB better than the current AP
+- The camera reconnects directly to the selected BSSID and channel
+- If the roam does not succeed, normal reconnect/fallback handling resumes
+- Roam attempts and successes are visible in `/status`
+
+This hysteresis avoids unnecessary switching between access points with nearly
+identical signal levels.

@@ -1,39 +1,51 @@
 # Firmware
 
-Initial Arduino firmware for the AI-Thinker style ESP32-CAM + OV2640.
+Arduino firmware for the AI-Thinker style ESP32-CAM + OV2640.
 
 ## Features
 
-- Wi-Fi station mode
-- Automatic reconnect
 - OV2640 camera initialization
 - Browser UI on port 80
 - MJPEG stream on port 81
 - JPEG snapshot endpoint
-- JSON status endpoint with IP, RSSI, uptime and free heap
-- No Wi-Fi credentials committed to Git
-
-## Files
-
-- `esp32-cam-indoor.ino` - main firmware
-- `camera_pins.h` - AI-Thinker ESP32-CAM pin mapping
-- `secrets.example.h` - Wi-Fi credential template
+- JSON status endpoint
+- Persistent Wi-Fi configuration in ESP32 NVS
+- 30 second initial Wi-Fi connection timeout
+- Automatic fallback access point if Wi-Fi is missing or unavailable
+- Background Wi-Fi retry every 30 seconds while the fallback AP is active
+- Fallback AP shuts down automatically after the configured Wi-Fi reconnects
+- Wi-Fi configuration page with RSSI, BSSID, channel and reconnect counters
 
 ## First setup
 
 1. Install ESP32 board support in the Arduino IDE.
 2. Select an ESP32-CAM / AI-Thinker compatible board.
-3. Copy `secrets.example.h` to `secrets.h`.
-4. Enter the Wi-Fi SSID and password in `secrets.h`.
-5. Compile and upload using the ESP32-CAM-MB board.
-6. Open the serial monitor at 115200 baud.
-7. After boot, open the displayed IP address in a browser.
+3. Compile and upload using the ESP32-CAM-MB board.
+4. Open the serial monitor at 115200 baud.
+5. On first boot the camera starts a fallback AP because no Wi-Fi configuration exists.
+6. Connect to the AP `ESP32-CAM-XXXXXX`.
+7. Password: `esp32cam123`
+8. Open `http://192.168.4.1/config`.
+9. Enter SSID and Wi-Fi password and save.
+10. The ESP32-CAM restarts and connects to the configured WLAN.
 
-The local `secrets.h` file is ignored by Git and must not be committed.
+The Wi-Fi credentials are stored locally in ESP32 NVS and are not committed to Git.
+
+## Fallback behavior
+
+The Wi-Fi behavior intentionally follows the pattern used in the MGE UPS Controller project:
+
+- Stored WLAN available: connect in station mode.
+- No configuration or no connection within 30 seconds: start fallback AP.
+- If credentials exist, fallback mode uses AP+STA so the configured WLAN can still be retried.
+- Retry interval: 30 seconds.
+- After a successful reconnect, the fallback AP is stopped automatically.
+- The configuration page remains available under `/config`.
 
 ## Endpoints
 
 - `http://<camera-ip>/` - browser UI
+- `http://<camera-ip>/config` - Wi-Fi configuration
 - `http://<camera-ip>/jpg` - single JPEG snapshot
 - `http://<camera-ip>/status` - status JSON
 - `http://<camera-ip>:81/stream` - MJPEG stream

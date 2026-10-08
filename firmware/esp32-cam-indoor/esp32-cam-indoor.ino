@@ -6,7 +6,7 @@
 
 #include "camera_pins.h"
 
-static const char *APP_VERSION = "0.4.1";
+static const char *APP_VERSION = "0.5.0";
 static const char *AP_PASSWORD = "esp32cam123";
 static const unsigned long WIFI_CONNECT_TIMEOUT_MS = 30000;
 static const unsigned long WIFI_RETRY_INTERVAL_MS = 30000;
@@ -35,6 +35,7 @@ struct CameraSettings {
 };
 
 static CameraSettings cameraSettings;
+static bool flashLedOn = false;
 
 static const char *STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=frame";
 static const char *STREAM_BOUNDARY = "\r\n--frame\r\n";
@@ -220,6 +221,11 @@ static framesize_t frameSizeFromValue(const String &value) {
   return FRAMESIZE_VGA;
 }
 
+static void setFlashLed(bool on) {
+  flashLedOn = on;
+  digitalWrite(FLASH_LED_GPIO_NUM, on ? HIGH : LOW);
+}
+
 static String frameSizeValue(framesize_t size) {
   switch (size) {
     case FRAMESIZE_QQVGA: return "QQVGA";
@@ -383,6 +389,13 @@ static String rootPage() {
   html += F("<a href='/status'>Status JSON</a> · ");
   html += F("<a href='/camera'>Kamera-Settings</a> · ");
   html += F("<a href='/config'>WLAN-Konfiguration</a></div>");
+
+  html += F("<div class='meta' style='margin-top:18px'><b>Flash-LED:</b> ");
+  html += flashLedOn ? "AN" : "AUS";
+  html += F(" &nbsp; <form method='POST' action='/flash/on' style='display:inline'>");
+  html += F("<button type='submit'>LED an</button></form> ");
+  html += F("<form method='POST' action='/flash/off' style='display:inline'>");
+  html += F("<button type='submit'>LED aus</button></form></div>");
 
   if (WiFi.status() == WL_CONNECTED) {
     html += F("<script>document.getElementById('stream').src='http://'+location.hostname+':81/stream';</script>");
@@ -644,6 +657,20 @@ static esp_err_t camera_save_handler(httpd_req_t *req) {
   return httpd_resp_send(req, response.c_str(), response.length());
 }
 
+static esp_err_t flash_on_handler(httpd_req_t *req) {
+  setFlashLed(true);
+  httpd_resp_set_status(req, "303 See Other");
+  httpd_resp_set_hdr(req, "Location", "/");
+  return httpd_resp_send(req, nullptr, 0);
+}
+
+static esp_err_t flash_off_handler(httpd_req_t *req) {
+  setFlashLed(false);
+  httpd_resp_set_status(req, "303 See Other");
+  httpd_resp_set_hdr(req, "Location", "/");
+  return httpd_resp_send(req, nullptr, 0);
+}
+
 static esp_err_t root_handler(httpd_req_t *req) {
   String html = rootPage();
   httpd_resp_set_type(req, "text/html; charset=utf-8");
@@ -727,7 +754,10 @@ static esp_err_t jpg_handler(httpd_req_t *req) {
 
 static esp_err_t status_handler(httpd_req_t *req) {
   String body;
-  body.reserve(512);
+  body.reserve(1200);
+
+  sensor_t *sensor = esp_camera_sensor_get();
+  const bool cameraDetected = sensor != nullptr;
 
   body += F("{\"version\":\"");
   body += APP_VERSION;
@@ -747,11 +777,38 @@ static esp_err_t status_handler(httpd_req_t *req) {
   body += String(millis() / 1000UL);
   body += F(",\"free_heap\":");
   body += String(ESP.getFreeHeap());
+  body += F(",\"psram\":");
+  body += psramFound() ? "true" : "false";
+  body += F(",\"psram_size\":");
+  body += String(ESP.getPsramSize());
+  body += F(",\"free_psram\":");
+  body += String(ESP.getFreePsram());
   body += F(",\"reconnect_attempts\":");
   body += String(wifiReconnectAttempts);
   body += F(",\"reconnect_successes\":");
   body += String(wifiReconnectSuccesses);
-  body += F("}");
+
+  body += F(",\"camera\":{\"detected\":");
+  body += cameraDetected ? "true" : "false";
+  body += F(",\"sensor_pid\":");
+  body += cameraDetected ? String(sensor->id.PID) : String("null");
+  body += F(",\"resolution\":\"");
+  body += frameSizeName(cameraSettings.frameSize);
+  body += F("\",\"jpeg_quality\":");
+  body += String(cameraSettings.jpegQuality);
+  body += F(",\"brightness\":");
+  body += String(cameraSettings.brightness);
+  body += F(",\"contrast\":");
+  body += String(cameraSettings.contrast);
+  body += F(",\"saturation\":");
+  body += String(cameraSettings.saturation);
+  body += F(",\"vflip\":");
+  body += cameraSettings.vflip ? "true" : "false";
+  body += F(",\"hmirror\":");
+  body += cameraSettings.hmirror ? "true" : "false";
+  body += F(",\"flash_led\":");
+  body += flashLedOn ? "true" : "false";
+  body += F("}}");
 
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -841,6 +898,18 @@ static void startWebServers() {
     statusUri.method = HTTP_GET;
     statusUri.handler = status_handler;
     httpd_register_uri_handler(http_server, &statusUri);
+
+    httpd_uri_t flashOnUri = {};
+    flashOnUri.uri = "/flash/on";
+    flashOnUri.method = HTTP_POST;
+    flashOnUri.handler = flash_on_handler;
+    httpd_register_uri_handler(http_server, &flashOnUri);
+
+    httpd_uri_t flashOffUri = {};
+    flashOffUri.uri = "/flash/off";
+    flashOffUri.method = HTTP_POST;
+    flashOffUri.handler = flash_off_handler;
+    httpd_register_uri_handler(http_server, &flashOffUri);
   }
 
   httpd_config_t streamConfig = HTTPD_DEFAULT_CONFIG();
@@ -907,6 +976,9 @@ void setup() {
   Serial.printf("ESP32-CAM Indoor v%s starting...\n", APP_VERSION);
 
   loadCameraConfig();
+
+  pinMode(FLASH_LED_GPIO_NUM, OUTPUT);
+  setFlashLed(false);
 
   if (!initCamera()) {
     delay(3000);

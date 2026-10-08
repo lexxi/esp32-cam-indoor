@@ -1,0 +1,15 @@
+# Build output
+build/
+.pio/
+.vscode/
+
+# OS / editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.tmp
+
+# Local configuration / secrets
+secrets.h
+credentials.h
+.env

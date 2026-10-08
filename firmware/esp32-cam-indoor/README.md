@@ -167,3 +167,10 @@ The NTP synchronization and local time reporting remain enabled, but the
 experimental JPG timestamp overlay has been removed again. This returns
 snapshot handling to the direct JPEG path used before v0.8.0 so stream
 stability can be compared cleanly with the v0.7.x firmware.
+
+
+## v0.8.2 stream baseline test
+
+NTP/time support has been removed again for a clean A/B comparison with the
+known-smooth v0.7.x stream behavior. Camera, roaming, flash LED, Wi-Fi settings
+and diagnostics remain unchanged.

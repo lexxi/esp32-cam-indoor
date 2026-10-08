@@ -1,52 +1,441 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <Preferences.h>
 #include "esp_camera.h"
 #include "esp_http_server.h"
 
 #include "camera_pins.h"
-#include "secrets.h"
+
+static const char *APP_VERSION = "0.2.0";
+static const char *AP_PASSWORD = "esp32cam123";
+static const unsigned long WIFI_CONNECT_TIMEOUT_MS = 30000;
+static const unsigned long WIFI_RETRY_INTERVAL_MS = 30000;
 
 static httpd_handle_t http_server = nullptr;
 static httpd_handle_t stream_server = nullptr;
+
+static Preferences prefs;
+static String wifiSsid;
+static String wifiPassword;
+static bool apMode = false;
+static bool wifiWasConnected = false;
+static unsigned long wifiLastRetryMillis = 0;
+static unsigned long wifiReconnectAttempts = 0;
+static unsigned long wifiReconnectSuccesses = 0;
+static unsigned long wifiLastConnectedMillis = 0;
 
 static const char *STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=frame";
 static const char *STREAM_BOUNDARY = "\r\n--frame\r\n";
 static const char *STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
 
-static const char INDEX_HTML[] PROGMEM = R"HTML(
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>ESP32-CAM Indoor</title>
-  <style>
-    body { font-family: system-ui, sans-serif; margin: 0; background: #111; color: #eee; }
-    main { max-width: 900px; margin: auto; padding: 16px; }
-    img { width: 100%; height: auto; border-radius: 8px; background: #222; }
-    .meta { margin-top: 12px; color: #bbb; }
-    a { color: #8ec5ff; }
-  </style>
-</head>
-<body>
-<main>
-  <h1>ESP32-CAM Indoor</h1>
-  <img id="stream" alt="camera stream">
-  <div class="meta">
-    <a href="/jpg">Snapshot</a> · <a href="/status">Status JSON</a>
-  </div>
-</main>
-<script>
-  document.getElementById('stream').src =
-    'http://' + location.hostname + ':81/stream';
-</script>
-</body>
-</html>
-)HTML";
+static String htmlEscape(const String &value) {
+  String out;
+  out.reserve(value.length() + 8);
+  for (size_t i = 0; i < value.length(); i++) {
+    char c = value[i];
+    if (c == '&') out += "&amp;";
+    else if (c == '<') out += "&lt;";
+    else if (c == '>') out += "&gt;";
+    else if (c == '"') out += "&quot;";
+    else out += c;
+  }
+  return out;
+}
+
+static String urlDecode(const String &value) {
+  String out;
+  out.reserve(value.length());
+
+  for (size_t i = 0; i < value.length(); i++) {
+    char c = value[i];
+
+    if (c == '+') {
+      out += ' ';
+    } else if (c == '%' && i + 2 < value.length()) {
+      char h1 = value[i + 1];
+      char h2 = value[i + 2];
+
+      auto hexValue = [](char h) -> int {
+        if (h >= '0' && h <= '9') return h - '0';
+        if (h >= 'A' && h <= 'F') return h - 'A' + 10;
+        if (h >= 'a' && h <= 'f') return h - 'a' + 10;
+        return -1;
+      };
+
+      int a = hexValue(h1);
+      int b = hexValue(h2);
+
+      if (a >= 0 && b >= 0) {
+        out += char((a << 4) | b);
+        i += 2;
+      } else {
+        out += c;
+      }
+    } else {
+      out += c;
+    }
+  }
+
+  return out;
+}
+
+static String formValue(const String &body, const String &key) {
+  const String needle = key + "=";
+  int start = body.indexOf(needle);
+
+  if (start < 0) return "";
+
+  start += needle.length();
+  int end = body.indexOf('&', start);
+
+  if (end < 0) end = body.length();
+
+  return urlDecode(body.substring(start, end));
+}
+
+static String chipSuffix() {
+  uint64_t chip = ESP.getEfuseMac();
+  char suffix[7];
+  snprintf(suffix, sizeof(suffix), "%06X", (uint32_t)(chip & 0xFFFFFF));
+  return String(suffix);
+}
+
+static String fallbackApSsid() {
+  return "ESP32-CAM-" + chipSuffix();
+}
+
+static const char *wifiSignalRating(int32_t rssi) {
+  if (rssi >= -50) return "sehr gut";
+  if (rssi >= -60) return "gut";
+  if (rssi >= -67) return "brauchbar";
+  if (rssi >= -70) return "grenzwertig";
+  return "schlecht";
+}
+
+static bool loadWifiConfig() {
+  prefs.begin("wifi", true);
+  wifiSsid = prefs.getString("ssid", "");
+  wifiPassword = prefs.getString("password", "");
+  prefs.end();
+
+  wifiSsid.trim();
+  return wifiSsid.length() > 0;
+}
+
+static bool saveWifiConfig(const String &ssid, const String &password, bool updatePassword) {
+  prefs.begin("wifi", false);
+  bool ok1 = prefs.putString("ssid", ssid) > 0;
+  bool ok2 = true;
+
+  if (updatePassword) {
+    ok2 = prefs.putString("password", password) >= 0;
+  }
+
+  prefs.end();
+  return ok1 && ok2;
+}
+
+static void startAccessPoint() {
+  apMode = true;
+
+  if (wifiSsid.length() > 0) {
+    WiFi.mode(WIFI_AP_STA);
+  } else {
+    WiFi.mode(WIFI_AP);
+  }
+
+  WiFi.setSleep(false);
+
+  const String ssid = fallbackApSsid();
+  WiFi.softAP(ssid.c_str(), AP_PASSWORD);
+
+  if (wifiSsid.length() > 0) {
+    WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
+  }
+
+  Serial.println();
+  Serial.println("Fallback AP started");
+  Serial.printf("SSID: %s\n", ssid.c_str());
+  Serial.printf("Password: %s\n", AP_PASSWORD);
+  Serial.printf("AP IP: %s\n", WiFi.softAPIP().toString().c_str());
+}
+
+static bool connectWifi() {
+  if (!loadWifiConfig()) {
+    Serial.println("No stored Wi-Fi configuration");
+    return false;
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(false);
+  WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
+
+  Serial.printf("Connecting to Wi-Fi SSID: %s", wifiSsid.c_str());
+
+  const unsigned long started = millis();
+
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - started < WIFI_CONNECT_TIMEOUT_MS) {
+    delay(250);
+    Serial.print('.');
+  }
+
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    apMode = false;
+    wifiWasConnected = true;
+    wifiLastConnectedMillis = millis();
+
+    Serial.println("Wi-Fi connected");
+    Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
+    return true;
+  }
+
+  Serial.println("Wi-Fi connection failed");
+  return false;
+}
+
+static void maintainWifi() {
+  const bool connected = (WiFi.status() == WL_CONNECTED);
+
+  if (connected) {
+    if (!wifiWasConnected) {
+      wifiWasConnected = true;
+      wifiReconnectSuccesses++;
+      wifiLastConnectedMillis = millis();
+
+      Serial.println("Wi-Fi reconnected");
+      Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+      Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
+
+      if (apMode) {
+        WiFi.softAPdisconnect(true);
+        WiFi.mode(WIFI_STA);
+        WiFi.setSleep(false);
+        apMode = false;
+        Serial.println("Fallback AP stopped");
+      }
+    }
+
+    return;
+  }
+
+  if (wifiWasConnected) {
+    wifiWasConnected = false;
+    Serial.println("Wi-Fi connection lost");
+  }
+
+  if (wifiSsid.length() == 0) {
+    if (!apMode) startAccessPoint();
+    return;
+  }
+
+  if (millis() - wifiLastRetryMillis < WIFI_RETRY_INTERVAL_MS) {
+    return;
+  }
+
+  wifiLastRetryMillis = millis();
+  wifiReconnectAttempts++;
+
+  Serial.printf("Wi-Fi reconnect attempt %lu\n", wifiReconnectAttempts);
+
+  if (!apMode) {
+    startAccessPoint();
+  } else {
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
+  }
+}
+
+static String rootPage() {
+  String html;
+  html.reserve(3000);
+
+  html += F("<!doctype html><html lang='de'><head><meta charset='utf-8'>");
+  html += F("<meta name='viewport' content='width=device-width,initial-scale=1'>");
+  html += F("<title>ESP32-CAM Indoor</title>");
+  html += F("<style>body{font-family:system-ui,sans-serif;margin:0;background:#111;color:#eee}");
+  html += F("main{max-width:900px;margin:auto;padding:16px}img{width:100%;height:auto;border-radius:8px;background:#222}");
+  html += F(".meta{margin-top:12px;color:#bbb}a{color:#8ec5ff}.warn{color:#ffcb6b}.ok{color:#8bd450}</style>");
+  html += F("</head><body><main><h1>ESP32-CAM Indoor</h1>");
+
+  html += F("<p>Firmware <b>v");
+  html += APP_VERSION;
+  html += F("</b></p>");
+
+  if (apMode) {
+    html += F("<p class='warn'><b>Fallback AP aktiv</b></p>");
+  } else {
+    html += F("<p class='ok'><b>WLAN verbunden</b> · ");
+    html += WiFi.localIP().toString();
+    html += F(" · ");
+    html += String(WiFi.RSSI());
+    html += F(" dBm</p>");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    html += F("<img id='stream' alt='camera stream'>");
+  } else {
+    html += F("<p>Kein Kamera-Stream, solange keine WLAN-Verbindung besteht.</p>");
+  }
+
+  html += F("<div class='meta'><a href='/jpg'>Snapshot</a> · ");
+  html += F("<a href='/status'>Status JSON</a> · ");
+  html += F("<a href='/config'>WLAN-Konfiguration</a></div>");
+
+  if (WiFi.status() == WL_CONNECTED) {
+    html += F("<script>document.getElementById('stream').src='http://'+location.hostname+':81/stream';</script>");
+  }
+
+  html += F("</main></body></html>");
+  return html;
+}
+
+static String configPage() {
+  const bool connected = WiFi.status() == WL_CONNECTED;
+  String html;
+  html.reserve(5000);
+
+  html += F("<!doctype html><html lang='de'><head><meta charset='utf-8'>");
+  html += F("<meta name='viewport' content='width=device-width,initial-scale=1'>");
+  html += F("<title>WLAN - ESP32-CAM Indoor</title>");
+  html += F("<style>body{font-family:system-ui,sans-serif;max-width:820px;margin:30px auto;padding:0 18px;background:#f4f4f4;color:#222}");
+  html += F(".card{background:#fff;padding:20px;margin-bottom:18px;border-radius:10px;box-shadow:0 1px 5px #bbb}");
+  html += F("input{width:100%;padding:10px;margin:6px 0 14px;box-sizing:border-box}button{padding:10px 18px;cursor:pointer}");
+  html += F("table{width:100%;border-collapse:collapse}td{padding:7px;border-bottom:1px solid #ddd}a{color:#06c}</style></head><body>");
+
+  html += F("<div class='card'><h1>WLAN</h1><table>");
+  html += F("<tr><td>Status</td><td><b>");
+  if (connected) html += F("verbunden");
+  else if (apMode) html += F("Fallback AP aktiv");
+  else html += F("nicht verbunden");
+  html += F("</b></td></tr>");
+
+  html += F("<tr><td>Konfigurierte SSID</td><td>");
+  html += wifiSsid.length() ? htmlEscape(wifiSsid) : String("-");
+  html += F("</td></tr>");
+
+  html += F("<tr><td>Betriebsart</td><td>");
+  if (apMode && connected) html += F("STA + AP");
+  else if (apMode) html += F("Fallback AP");
+  else html += F("STA");
+  html += F("</td></tr>");
+
+  html += F("<tr><td>IP-Adresse</td><td>");
+  html += connected ? WiFi.localIP().toString() : String("-");
+  html += F("</td></tr>");
+
+  html += F("<tr><td>Fallback AP</td><td>");
+  html += fallbackApSsid();
+  html += F("</td></tr>");
+
+  if (connected) {
+    int32_t rssi = WiFi.RSSI();
+    html += F("<tr><td>Signalstärke</td><td>");
+    html += String(rssi);
+    html += F(" dBm (");
+    html += wifiSignalRating(rssi);
+    html += F(")</td></tr>");
+
+    html += F("<tr><td>BSSID / Access Point</td><td>");
+    html += WiFi.BSSIDstr();
+    html += F("</td></tr>");
+
+    html += F("<tr><td>Kanal</td><td>");
+    html += String(WiFi.channel());
+    html += F("</td></tr>");
+  }
+
+  html += F("<tr><td>Reconnect-Versuche</td><td>");
+  html += String(wifiReconnectAttempts);
+  html += F("</td></tr>");
+
+  html += F("<tr><td>Erfolgreiche Reconnects</td><td>");
+  html += String(wifiReconnectSuccesses);
+  html += F("</td></tr>");
+
+  html += F("</table></div>");
+
+  html += F("<div class='card'><h2>WLAN-Konfiguration</h2>");
+  html += F("<form method='POST' action='/save'>");
+  html += F("<label>SSID</label><input name='ssid' value='");
+  html += htmlEscape(wifiSsid);
+  html += F("' required>");
+  html += F("<label>Passwort</label>");
+  html += F("<input type='password' name='password' value='' placeholder='Leer lassen = bestehendes Passwort behalten'>");
+  html += F("<button type='submit'>Speichern und neu starten</button></form>");
+  html += F("<p><small>Das gespeicherte WLAN-Passwort wird nicht angezeigt.</small></p>");
+  html += F("<p><a href='/'>Zurück zur Kamera</a></p></div></body></html>");
+
+  return html;
+}
 
 static esp_err_t root_handler(httpd_req_t *req) {
-  httpd_resp_set_type(req, "text/html");
-  return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
+  String html = rootPage();
+  httpd_resp_set_type(req, "text/html; charset=utf-8");
+  return httpd_resp_send(req, html.c_str(), html.length());
+}
+
+static esp_err_t config_handler(httpd_req_t *req) {
+  String html = configPage();
+  httpd_resp_set_type(req, "text/html; charset=utf-8");
+  return httpd_resp_send(req, html.c_str(), html.length());
+}
+
+static esp_err_t save_handler(httpd_req_t *req) {
+  if (req->content_len <= 0 || req->content_len > 1024) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid form data");
+    return ESP_FAIL;
+  }
+
+  String body;
+  body.reserve(req->content_len + 1);
+
+  int remaining = req->content_len;
+  char buffer[256];
+
+  while (remaining > 0) {
+    int received = httpd_req_recv(req, buffer, min(remaining, (int)sizeof(buffer)));
+    if (received <= 0) {
+      httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to read form data");
+      return ESP_FAIL;
+    }
+
+    body.concat(buffer, received);
+    remaining -= received;
+  }
+
+  String newSsid = formValue(body, "ssid");
+  String newPassword = formValue(body, "password");
+  newSsid.trim();
+
+  if (newSsid.length() == 0) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "SSID missing");
+    return ESP_FAIL;
+  }
+
+  const bool updatePassword = newPassword.length() > 0 || wifiSsid.length() == 0;
+
+  if (!saveWifiConfig(newSsid, newPassword, updatePassword)) {
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Could not save Wi-Fi configuration");
+    return ESP_FAIL;
+  }
+
+  const char *response =
+      "<!doctype html><html><head><meta charset='utf-8'></head><body>"
+      "<h1>Gespeichert</h1><p>WLAN-Konfiguration gespeichert. Neustart...</p>"
+      "</body></html>";
+
+  httpd_resp_set_type(req, "text/html; charset=utf-8");
+  httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
+
+  delay(1000);
+  ESP.restart();
+  return ESP_OK;
 }
 
 static esp_err_t jpg_handler(httpd_req_t *req) {
@@ -64,29 +453,41 @@ static esp_err_t jpg_handler(httpd_req_t *req) {
 }
 
 static esp_err_t status_handler(httpd_req_t *req) {
-  char body[256];
-  const uint32_t uptime = millis() / 1000;
-  const int rssi = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0;
+  String body;
+  body.reserve(512);
 
-  snprintf(
-      body, sizeof(body),
-      "{\"wifi\":\"%s\",\"rssi\":%d,\"ip\":\"%s\",\"uptime_s\":%lu,\"free_heap\":%u}",
-      WiFi.status() == WL_CONNECTED ? "connected" : "disconnected",
-      rssi,
-      WiFi.localIP().toString().c_str(),
-      static_cast<unsigned long>(uptime),
-      ESP.getFreeHeap());
+  body += F("{\"version\":\"");
+  body += APP_VERSION;
+  body += F("\",\"wifi\":\"");
+  body += (WiFi.status() == WL_CONNECTED ? "connected" : "disconnected");
+  body += F("\",\"ap_mode\":");
+  body += apMode ? "true" : "false";
+  body += F(",\"configured_ssid\":\"");
+  body += wifiSsid;
+  body += F("\",\"rssi\":");
+  body += WiFi.status() == WL_CONNECTED ? String(WiFi.RSSI()) : String("null");
+  body += F(",\"ip\":\"");
+  body += WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String("");
+  body += F("\",\"ap_ip\":\"");
+  body += apMode ? WiFi.softAPIP().toString() : String("");
+  body += F("\",\"uptime_s\":");
+  body += String(millis() / 1000UL);
+  body += F(",\"free_heap\":");
+  body += String(ESP.getFreeHeap());
+  body += F(",\"reconnect_attempts\":");
+  body += String(wifiReconnectAttempts);
+  body += F(",\"reconnect_successes\":");
+  body += String(wifiReconnectSuccesses);
+  body += F("}");
 
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-  return httpd_resp_sendstr(req, body);
+  return httpd_resp_send(req, body.c_str(), body.length());
 }
 
 static esp_err_t stream_handler(httpd_req_t *req) {
   esp_err_t result = httpd_resp_set_type(req, STREAM_CONTENT_TYPE);
-  if (result != ESP_OK) {
-    return result;
-  }
+  if (result != ESP_OK) return result;
 
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -99,12 +500,10 @@ static esp_err_t stream_handler(httpd_req_t *req) {
     }
 
     char header[64];
-    const int header_len = snprintf(header, sizeof(header), STREAM_PART, fb->len);
+    const int headerLen = snprintf(header, sizeof(header), STREAM_PART, fb->len);
 
     result = httpd_resp_send_chunk(req, STREAM_BOUNDARY, strlen(STREAM_BOUNDARY));
-    if (result == ESP_OK) {
-      result = httpd_resp_send_chunk(req, header, header_len);
-    }
+    if (result == ESP_OK) result = httpd_resp_send_chunk(req, header, headerLen);
     if (result == ESP_OK) {
       result = httpd_resp_send_chunk(
           req,
@@ -114,57 +513,66 @@ static esp_err_t stream_handler(httpd_req_t *req) {
 
     esp_camera_fb_return(fb);
 
-    if (result != ESP_OK) {
-      break;
-    }
-
+    if (result != ESP_OK) break;
     delay(1);
   }
 
   return result;
 }
 
-static void start_web_servers() {
+static void startWebServers() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = 80;
   config.ctrl_port = 32768;
-  config.max_uri_handlers = 8;
+  config.max_uri_handlers = 10;
 
   if (httpd_start(&http_server, &config) == ESP_OK) {
-    httpd_uri_t root_uri = {};
-    root_uri.uri = "/";
-    root_uri.method = HTTP_GET;
-    root_uri.handler = root_handler;
-    httpd_register_uri_handler(http_server, &root_uri);
+    httpd_uri_t rootUri = {};
+    rootUri.uri = "/";
+    rootUri.method = HTTP_GET;
+    rootUri.handler = root_handler;
+    httpd_register_uri_handler(http_server, &rootUri);
 
-    httpd_uri_t jpg_uri = {};
-    jpg_uri.uri = "/jpg";
-    jpg_uri.method = HTTP_GET;
-    jpg_uri.handler = jpg_handler;
-    httpd_register_uri_handler(http_server, &jpg_uri);
+    httpd_uri_t configUri = {};
+    configUri.uri = "/config";
+    configUri.method = HTTP_GET;
+    configUri.handler = config_handler;
+    httpd_register_uri_handler(http_server, &configUri);
 
-    httpd_uri_t status_uri = {};
-    status_uri.uri = "/status";
-    status_uri.method = HTTP_GET;
-    status_uri.handler = status_handler;
-    httpd_register_uri_handler(http_server, &status_uri);
+    httpd_uri_t saveUri = {};
+    saveUri.uri = "/save";
+    saveUri.method = HTTP_POST;
+    saveUri.handler = save_handler;
+    httpd_register_uri_handler(http_server, &saveUri);
+
+    httpd_uri_t jpgUri = {};
+    jpgUri.uri = "/jpg";
+    jpgUri.method = HTTP_GET;
+    jpgUri.handler = jpg_handler;
+    httpd_register_uri_handler(http_server, &jpgUri);
+
+    httpd_uri_t statusUri = {};
+    statusUri.uri = "/status";
+    statusUri.method = HTTP_GET;
+    statusUri.handler = status_handler;
+    httpd_register_uri_handler(http_server, &statusUri);
   }
 
-  httpd_config_t stream_config = HTTPD_DEFAULT_CONFIG();
-  stream_config.server_port = 81;
-  stream_config.ctrl_port = 32769;
-  stream_config.max_uri_handlers = 4;
+  httpd_config_t streamConfig = HTTPD_DEFAULT_CONFIG();
+  streamConfig.server_port = 81;
+  streamConfig.ctrl_port = 32769;
+  streamConfig.max_uri_handlers = 4;
 
-  if (httpd_start(&stream_server, &stream_config) == ESP_OK) {
-    httpd_uri_t stream_uri = {};
-    stream_uri.uri = "/stream";
-    stream_uri.method = HTTP_GET;
-    stream_uri.handler = stream_handler;
-    httpd_register_uri_handler(stream_server, &stream_uri);
+  if (httpd_start(&stream_server, &streamConfig) == ESP_OK) {
+    httpd_uri_t streamUri = {};
+    streamUri.uri = "/stream";
+    streamUri.method = HTTP_GET;
+    streamUri.handler = stream_handler;
+    httpd_register_uri_handler(stream_server, &streamUri);
   }
 }
 
-static bool init_camera() {
+static bool initCamera() {
   camera_config_t config = {};
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -196,67 +604,48 @@ static bool init_camera() {
   config.fb_location = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
 
   esp_err_t err = esp_camera_init(&config);
+
   if (err != ESP_OK) {
     Serial.printf("Camera init failed: 0x%x\n", err);
     return false;
   }
 
   sensor_t *sensor = esp_camera_sensor_get();
-  if (sensor) {
-    sensor->set_framesize(sensor, FRAMESIZE_VGA);
-  }
+  if (sensor) sensor->set_framesize(sensor, FRAMESIZE_VGA);
 
   return true;
-}
-
-static void connect_wifi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  WiFi.setAutoReconnect(true);
-  WiFi.persistent(false);
-
-  Serial.printf("Connecting to Wi-Fi SSID: %s\n", WIFI_SSID);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  const uint32_t started = millis();
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print('.');
-    if (millis() - started > 30000) {
-      Serial.println("\nWi-Fi connection timeout; restarting...");
-      delay(1000);
-      ESP.restart();
-    }
-  }
-
-  Serial.println();
-  Serial.printf("Wi-Fi connected. IP: %s\n", WiFi.localIP().toString().c_str());
-  Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
 }
 
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println();
-  Serial.println("ESP32-CAM Indoor starting...");
 
-  if (!init_camera()) {
+  Serial.println();
+  Serial.printf("ESP32-CAM Indoor v%s starting...\n", APP_VERSION);
+
+  if (!initCamera()) {
     delay(3000);
     ESP.restart();
   }
 
-  connect_wifi();
-  start_web_servers();
+  if (!connectWifi()) {
+    startAccessPoint();
+  }
 
-  Serial.printf("Web UI:   http://%s/\n", WiFi.localIP().toString().c_str());
-  Serial.printf("Snapshot: http://%s/jpg\n", WiFi.localIP().toString().c_str());
-  Serial.printf("Stream:   http://%s:81/stream\n", WiFi.localIP().toString().c_str());
+  startWebServers();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("Web UI:   http://%s/\n", WiFi.localIP().toString().c_str());
+    Serial.printf("Snapshot: http://%s/jpg\n", WiFi.localIP().toString().c_str());
+    Serial.printf("Stream:   http://%s:81/stream\n", WiFi.localIP().toString().c_str());
+  }
+
+  if (apMode) {
+    Serial.printf("Config UI: http://%s/config\n", WiFi.softAPIP().toString().c_str());
+  }
 }
 
 void loop() {
-  if (WiFi.status() != WL_CONNECTED) {
-    WiFi.reconnect();
-  }
-
-  delay(1000);
+  maintainWifi();
+  delay(250);
 }

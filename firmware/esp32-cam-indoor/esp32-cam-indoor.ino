@@ -6,7 +6,7 @@
 
 #include "camera_pins.h"
 
-static const char *APP_VERSION = "0.8.3";
+static const char *APP_VERSION = "0.8.4";
 static const char *AP_PASSWORD = "esp32cam123";
 static const unsigned long WIFI_CONNECT_TIMEOUT_MS = 30000;
 static const unsigned long WIFI_RETRY_INTERVAL_MS = 30000;
@@ -519,7 +519,10 @@ static String rootPage() {
   html += F("<title>ESP32-CAM Indoor</title>");
   html += F("<style>body{font-family:system-ui,sans-serif;margin:0;background:#111;color:#eee}");
   html += F("main{max-width:900px;margin:auto;padding:16px}img{width:100%;height:auto;border-radius:8px;background:#222}");
-  html += F(".meta{margin-top:12px;color:#bbb}a{color:#8ec5ff}.warn{color:#ffcb6b}.ok{color:#8bd450}</style>");
+  html += F(".meta{margin-top:12px;color:#bbb}a{color:#8ec5ff}.warn{color:#ffcb6b}.ok{color:#8bd450}");
+  html += F(".settings{margin-top:22px;padding:14px;background:#1b1b1b;border-radius:8px}");
+  html += F(".settings table{width:100%;border-collapse:collapse}.settings td{padding:5px 0;border-bottom:1px solid #333}");
+  html += F(".settings td:last-child{text-align:right;color:#fff}</style>");
   html += F("</head><body><main><h1>ESP32-CAM Indoor</h1>");
 
   html += F("<p>Firmware <b>v");
@@ -553,6 +556,35 @@ static String rootPage() {
   html += F("<button type='submit'>LED an</button></form> ");
   html += F("<form method='POST' action='/flash/off' style='display:inline'>");
   html += F("<button type='submit'>LED aus</button></form></div>");
+
+  html += F("<div class='settings'><h2>Kamera-Settings</h2><table>");
+  html += F("<tr><td>Auflösung</td><td>");
+  html += frameSizeName(cameraSettings.frameSize);
+  html += F("</td></tr>");
+  html += F("<tr><td>JPEG Qualität</td><td>");
+  html += String(cameraSettings.jpegQuality);
+  html += F("</td></tr>");
+  html += F("<tr><td>Helligkeit</td><td>");
+  html += String(cameraSettings.brightness);
+  html += F("</td></tr>");
+  html += F("<tr><td>Kontrast</td><td>");
+  html += String(cameraSettings.contrast);
+  html += F("</td></tr>");
+  html += F("<tr><td>Sättigung</td><td>");
+  html += String(cameraSettings.saturation);
+  html += F("</td></tr>");
+  html += F("<tr><td>Vertikal drehen</td><td>");
+  html += cameraSettings.vflip ? "ja" : "nein";
+  html += F("</td></tr>");
+  html += F("<tr><td>Horizontal spiegeln</td><td>");
+  html += cameraSettings.hmirror ? "ja" : "nein";
+  html += F("</td></tr>");
+  html += F("<tr><td>Capture-Modus</td><td>");
+  html += isHighResolution(cameraSettings.frameSize)
+      ? "High-Resolution / stabil"
+      : "Stream / niedrige Latenz";
+  html += F("</td></tr>");
+  html += F("</table><p><a href='/camera'>Kamera-Settings ändern</a></p></div>");
 
   if (WiFi.status() == WL_CONNECTED) {
     html += F("<script>document.getElementById('stream').src='http://'+location.hostname+':81/stream';</script>");

@@ -21,6 +21,8 @@ Arduino firmware for the AI-Thinker style ESP32-CAM + OV2640.
 - Persistent camera settings stored in ESP32 NVS
 - Camera configuration page under `/camera`
 - Resolution, JPEG quality, brightness, contrast, saturation, vertical flip and horizontal mirror
+- Flash LED on/off control from the main page
+- Extended status JSON with camera settings, sensor state and PSRAM diagnostics
 
 ## First setup
 
@@ -72,7 +74,9 @@ Changes are applied immediately and also used after the next reboot.
 - `http://<camera-ip>/config` - Wi-Fi configuration
 - `http://<camera-ip>/camera` - camera settings
 - `http://<camera-ip>/jpg` - single JPEG snapshot
-- `http://<camera-ip>/status` - status JSON
+- `http://<camera-ip>/status` - extended status JSON
+- `POST http://<camera-ip>/flash/on` - switch flash LED on
+- `POST http://<camera-ip>/flash/off` - switch flash LED off
 - `http://<camera-ip>:81/stream` - MJPEG stream
 
 ## Initial camera settings
@@ -83,3 +87,20 @@ Changes are applied immediately and also used after the next reboot.
 - Wi-Fi power saving disabled for better stream stability
 
 The first goal is stability, not maximum resolution. Resolution and quality can be increased after the power supply and Wi-Fi connection have been tested under continuous load.
+
+
+## Diagnostics
+
+The `/status` endpoint includes:
+
+- firmware version
+- Wi-Fi state, RSSI, IP and reconnect counters
+- free heap
+- PSRAM detected, total PSRAM and free PSRAM
+- camera sensor detected and sensor PID
+- configured resolution and JPEG quality
+- brightness, contrast and saturation
+- vertical flip and horizontal mirror
+- flash LED state
+
+The flash LED uses GPIO 4 on the AI-Thinker ESP32-CAM. It is deliberately OFF after every reboot.

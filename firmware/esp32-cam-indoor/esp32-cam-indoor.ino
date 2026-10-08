@@ -6,7 +6,7 @@
 
 #include "camera_pins.h"
 
-static const char *APP_VERSION = "0.6.0";
+static const char *APP_VERSION = "0.6.1";
 static const char *AP_PASSWORD = "esp32cam123";
 static const unsigned long WIFI_CONNECT_TIMEOUT_MS = 30000;
 static const unsigned long WIFI_RETRY_INTERVAL_MS = 30000;
@@ -848,8 +848,17 @@ static esp_err_t save_handler(httpd_req_t *req) {
   }
 
   const char *response =
-      "<!doctype html><html><head><meta charset='utf-8'></head><body>"
-      "<h1>Gespeichert</h1><p>WLAN-Konfiguration gespeichert. Neustart...</p>"
+      "<!doctype html><html lang='de'><head><meta charset='utf-8'>"
+      "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+      "<meta http-equiv='refresh' content='8;url=/'>"
+      "<title>WLAN gespeichert</title></head><body>"
+      "<h1>Gespeichert</h1>"
+      "<p>WLAN-Konfiguration gespeichert. Neustart...</p>"
+      "<p>Die Seite versucht in 8 Sekunden automatisch zur Kamera zurückzukehren.</p>"
+      "<p><small>Wenn du gerade vom Fallback-AP in dein normales WLAN wechselst, "
+      "ändert sich die IP-Adresse. In diesem Fall kann die automatische Weiterleitung "
+      "nicht funktionieren; öffne dann die neue Kamera-IP im normalen WLAN.</small></p>"
+      "<p><a href='/'>Jetzt versuchen</a></p>"
       "</body></html>";
 
   httpd_resp_set_type(req, "text/html; charset=utf-8");

@@ -189,3 +189,19 @@ different buffering modes depending on resolution:
 When changing between these two resolution classes, the camera restarts once so
 the framebuffer allocation is recreated with the correct policy. Changes within
 the same class are still applied immediately.
+
+
+## v0.8.5 non-blocking NTP and serial heartbeat
+
+NTP support is enabled again, but unlike the earlier test it no longer waits
+synchronously during startup. SNTP is configured after Wi-Fi connects and
+synchronizes in the background.
+
+- Time zone: CET/CEST with automatic daylight-saving time
+- NTP servers: `pool.ntp.org`, `time.nist.gov`
+- Local time and synchronization state are exposed in `/status`
+- The root page shows the current local time when synchronized
+- The JPG and MJPEG paths are unchanged; no image timestamp rendering is used
+- The serial console prints a compact firmware/status heartbeat every 60 seconds
+  with firmware version, uptime, IP/RSSI/BSSID, camera resolution/quality and
+  memory information

@@ -6,10 +6,13 @@
 
 #include "camera_pins.h"
 
-static const char *APP_VERSION = "0.5.0";
+static const char *APP_VERSION = "0.6.0";
 static const char *AP_PASSWORD = "esp32cam123";
 static const unsigned long WIFI_CONNECT_TIMEOUT_MS = 30000;
 static const unsigned long WIFI_RETRY_INTERVAL_MS = 30000;
+static const unsigned long WIFI_ROAM_CHECK_INTERVAL_MS = 60000;
+static const int WIFI_ROAM_TRIGGER_RSSI = -72;
+static const int WIFI_ROAM_MIN_IMPROVEMENT_DB = 6;
 
 static httpd_handle_t http_server = nullptr;
 static httpd_handle_t stream_server = nullptr;
@@ -23,6 +26,11 @@ static unsigned long wifiLastRetryMillis = 0;
 static unsigned long wifiReconnectAttempts = 0;
 static unsigned long wifiReconnectSuccesses = 0;
 static unsigned long wifiLastConnectedMillis = 0;
+static unsigned long wifiLastRoamCheckMillis = 0;
+static unsigned long wifiRoamAttempts = 0;
+static unsigned long wifiRoamSuccesses = 0;
+static bool wifiRoamInProgress = false;
+static String wifiRoamTargetBssid;
 
 struct CameraSettings {
   framesize_t frameSize = FRAMESIZE_VGA;
@@ -307,10 +315,16 @@ static void maintainWifi() {
   if (connected) {
     if (!wifiWasConnected) {
       wifiWasConnected = true;
-      wifiReconnectSuccesses++;
-      wifiLastConnectedMillis = millis();
+      if (wifiRoamInProgress) {
+        wifiRoamSuccesses++;
+        wifiRoamInProgress = false;
+        Serial.println("Wi-Fi roam completed");
+      } else {
+        wifiReconnectSuccesses++;
+        Serial.println("Wi-Fi reconnected");
+      }
 
-      Serial.println("Wi-Fi reconnected");
+      wifiLastConnectedMillis = millis();
       Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
       Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
 
@@ -340,6 +354,11 @@ static void maintainWifi() {
     return;
   }
 
+  if (wifiRoamInProgress) {
+    Serial.println("Wi-Fi roam timed out; falling back to normal reconnect");
+    wifiRoamInProgress = false;
+  }
+
   wifiLastRetryMillis = millis();
   wifiReconnectAttempts++;
 
@@ -351,6 +370,109 @@ static void maintainWifi() {
     WiFi.mode(WIFI_AP_STA);
     WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
   }
+}
+
+static void checkForBetterAccessPoint() {
+  if (WiFi.status() != WL_CONNECTED || apMode || wifiSsid.length() == 0) {
+    return;
+  }
+
+  if (wifiRoamInProgress) {
+    return;
+  }
+
+  if (millis() - wifiLastRoamCheckMillis < WIFI_ROAM_CHECK_INTERVAL_MS) {
+    return;
+  }
+
+  wifiLastRoamCheckMillis = millis();
+
+  const int currentRssi = WiFi.RSSI();
+
+  // Avoid scan interruptions while the current AP is already good enough.
+  if (currentRssi >= WIFI_ROAM_TRIGGER_RSSI) {
+    return;
+  }
+
+  const String currentBssid = WiFi.BSSIDstr();
+
+  Serial.printf("Roam scan: current AP %s at %d dBm\n",
+                currentBssid.c_str(), currentRssi);
+
+  int networkCount = WiFi.scanNetworks(false, false);
+
+  if (networkCount <= 0) {
+    WiFi.scanDelete();
+    return;
+  }
+
+  int bestRssi = currentRssi;
+  int bestChannel = 0;
+  uint8_t bestBssid[6] = {0};
+  String bestBssidString;
+  bool betterApFound = false;
+
+  for (int i = 0; i < networkCount; i++) {
+    if (WiFi.SSID(i) != wifiSsid) {
+      continue;
+    }
+
+    String candidateBssid = WiFi.BSSIDstr(i);
+
+    if (candidateBssid == currentBssid) {
+      continue;
+    }
+
+    int candidateRssi = WiFi.RSSI(i);
+
+    if (candidateRssi > bestRssi) {
+      bestRssi = candidateRssi;
+      bestChannel = WiFi.channel(i);
+
+      const uint8_t *candidate = WiFi.BSSID(i);
+      if (candidate) {
+        memcpy(bestBssid, candidate, 6);
+        bestBssidString = candidateBssid;
+        betterApFound = true;
+      }
+    }
+  }
+
+  WiFi.scanDelete();
+
+  if (!betterApFound ||
+      bestRssi < currentRssi + WIFI_ROAM_MIN_IMPROVEMENT_DB) {
+    Serial.printf("Roam scan: no sufficiently better AP found (best %d dBm)\n",
+                  bestRssi);
+    return;
+  }
+
+  wifiRoamAttempts++;
+  wifiRoamInProgress = true;
+  wifiRoamTargetBssid = bestBssidString;
+
+  Serial.printf("Roaming from %s (%d dBm) to %s (%d dBm), channel %d\n",
+                currentBssid.c_str(),
+                currentRssi,
+                bestBssidString.c_str(),
+                bestRssi,
+                bestChannel);
+
+  // Give the roam attempt a grace period before normal reconnect/fallback
+  // handling takes over.
+  wifiLastRetryMillis = millis();
+  wifiWasConnected = false;
+
+  WiFi.disconnect(false, false);
+  delay(100);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(
+      wifiSsid.c_str(),
+      wifiPassword.c_str(),
+      bestChannel,
+      bestBssid,
+      true);
 }
 
 static String rootPage() {
@@ -787,6 +909,19 @@ static esp_err_t status_handler(httpd_req_t *req) {
   body += String(wifiReconnectAttempts);
   body += F(",\"reconnect_successes\":");
   body += String(wifiReconnectSuccesses);
+  body += F(",\"bssid\":\"");
+  body += WiFi.status() == WL_CONNECTED ? WiFi.BSSIDstr() : String("");
+  body += F("\",\"channel\":");
+  body += WiFi.status() == WL_CONNECTED ? String(WiFi.channel()) : String("null");
+  body += F(",\"roam_attempts\":");
+  body += String(wifiRoamAttempts);
+  body += F(",\"roam_successes\":");
+  body += String(wifiRoamSuccesses);
+  body += F(",\"roam_in_progress\":");
+  body += wifiRoamInProgress ? "true" : "false";
+  body += F(",\"roam_target_bssid\":\"");
+  body += wifiRoamTargetBssid;
+  body += F("\"");
 
   body += F(",\"camera\":{\"detected\":");
   body += cameraDetected ? "true" : "false";
@@ -1007,5 +1142,6 @@ void setup() {
 
 void loop() {
   maintainWifi();
+  checkForBetterAccessPoint();
   delay(250);
 }

@@ -973,7 +973,10 @@ void setup() {
   delay(500);
 
   Serial.println();
-  Serial.printf("ESP32-CAM Indoor v%s starting...\n", APP_VERSION);
+  Serial.println("================================");
+  Serial.println("ESP32-CAM Indoor");
+  Serial.printf("Firmware version: v%s\n", APP_VERSION);
+  Serial.println("================================");
 
   loadCameraConfig();
 

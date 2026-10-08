@@ -15,6 +15,8 @@ Arduino firmware for the AI-Thinker style ESP32-CAM + OV2640.
 - Background Wi-Fi retry every 30 seconds while the fallback AP is active
 - Fallback AP shuts down automatically after the configured Wi-Fi reconnects
 - Wi-Fi configuration page with RSSI, BSSID, channel and reconnect counters
+- Wi-Fi scan directly from fallback AP mode
+- Click a detected SSID and join it from the configuration page
 
 ## First setup
 
@@ -26,8 +28,9 @@ Arduino firmware for the AI-Thinker style ESP32-CAM + OV2640.
 6. Connect to the AP `ESP32-CAM-XXXXXX`.
 7. Password: `esp32cam123`
 8. Open `http://192.168.4.1/config`.
-9. Enter SSID and Wi-Fi password and save.
-10. The ESP32-CAM restarts and connects to the configured WLAN.
+9. The page scans nearby 2.4-GHz WLANs.
+10. Click the desired SSID, enter its password and select **Speichern und verbinden**.
+11. The ESP32-CAM restarts and connects to the selected WLAN.
 
 The Wi-Fi credentials are stored locally in ESP32 NVS and are not committed to Git.
 
@@ -41,6 +44,7 @@ The Wi-Fi behavior intentionally follows the pattern used in the MGE UPS Control
 - Retry interval: 30 seconds.
 - After a successful reconnect, the fallback AP is stopped automatically.
 - The configuration page remains available under `/config`.
+- In fallback mode the AP and station interfaces run together, so scanning and joining are possible without first leaving the camera AP.
 
 ## Endpoints
 

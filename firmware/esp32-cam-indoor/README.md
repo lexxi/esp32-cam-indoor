@@ -253,3 +253,12 @@ through the application logger.
 - If the stream server cannot be restarted, the ESP32 performs a full restart as
   a fallback.
 - Idle cameras with no active stream client are not restarted by the watchdog.
+
+
+## v0.8.10 stream watchdog startup grace fix
+
+- Fixes an immediate false-positive watchdog restart when a new stream client
+  connects after the previous client has been disconnected for a while.
+- The watchdog timestamp is reset when the first active stream client connects,
+  so the new client gets a full 30-second grace period to send its first frame.
+- Additional concurrent clients do not reset the watchdog timer.

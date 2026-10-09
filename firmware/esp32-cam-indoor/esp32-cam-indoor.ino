@@ -9,7 +9,7 @@
 
 #include "camera_pins.h"
 
-static const char *APP_VERSION = "0.8.8";
+static const char *APP_VERSION = "0.8.9";
 static const char *AP_PASSWORD = "esp32cam123";
 static const unsigned long WIFI_CONNECT_TIMEOUT_MS = 30000;
 static const unsigned long WIFI_RETRY_INTERVAL_MS = 30000;
@@ -19,9 +19,14 @@ static const int WIFI_ROAM_TRIGGER_RSSI_DEFAULT = -72;
 static const int WIFI_ROAM_MIN_IMPROVEMENT_DB_DEFAULT = 4;
 static const char *LOG_FILE = "/system.log";
 static const size_t LOG_MAX_BYTES = 128 * 1024;
+static const unsigned long STREAM_WATCHDOG_TIMEOUT_MS = 30000;
 
 static httpd_handle_t http_server = nullptr;
 static httpd_handle_t stream_server = nullptr;
+static volatile int streamClientCount = 0;
+static volatile unsigned long streamLastFrameMillis = 0;
+static volatile unsigned long streamRestartCount = 0;
+static volatile bool streamRestartRequested = false;
 
 static String logBuffer;
 static bool logReady = false;
@@ -1453,6 +1458,16 @@ static esp_err_t status_handler(httpd_req_t *req) {
   body += F(",\"roam_target_bssid\":\"");
   body += wifiRoamTargetBssid;
   body += F("\"");
+  body += F(",\"stream_clients\":");
+  body += String(streamClientCount);
+  body += F(",\"stream_restarts\":");
+  body += String(streamRestartCount);
+  body += F(",\"last_frame_age_s\":");
+  if (streamLastFrameMillis > 0) {
+    body += String((millis() - streamLastFrameMillis) / 1000UL);
+  } else {
+    body += F("null");
+  }
 
   body += F(",\"camera\":{\"detected\":");
   body += cameraDetected ? "true" : "false";
@@ -1482,8 +1497,15 @@ static esp_err_t status_handler(httpd_req_t *req) {
 }
 
 static esp_err_t stream_handler(httpd_req_t *req) {
+  streamClientCount++;
+  logPrintf("Stream client connected, clients=%d\n", streamClientCount);
+
   esp_err_t result = httpd_resp_set_type(req, STREAM_CONTENT_TYPE);
-  if (result != ESP_OK) return result;
+  if (result != ESP_OK) {
+    streamClientCount--;
+    logPrintf("Stream client disconnected, clients=%d\n", streamClientCount);
+    return result;
+  }
 
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -1492,7 +1514,8 @@ static esp_err_t stream_handler(httpd_req_t *req) {
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
       logPrintln("Camera capture failed");
-      return ESP_FAIL;
+      result = ESP_FAIL;
+      break;
     }
 
     char header[64];
@@ -1510,11 +1533,24 @@ static esp_err_t stream_handler(httpd_req_t *req) {
     esp_camera_fb_return(fb);
 
     if (result != ESP_OK) break;
+
+    streamLastFrameMillis = millis();
+
+    if (streamRestartRequested) {
+      logPrintln("Stream client closed for watchdog restart");
+      result = ESP_FAIL;
+      break;
+    }
+
     delay(1);
   }
 
+  if (streamClientCount > 0) streamClientCount--;
+  logPrintf("Stream client disconnected, clients=%d\n", streamClientCount);
   return result;
 }
+
+static bool startStreamServer();
 
 static void startWebServers() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
@@ -1602,17 +1638,77 @@ static void startWebServers() {
     httpd_register_uri_handler(http_server, &roamingSaveUri);
   }
 
+  startStreamServer();
+}
+
+static bool startStreamServer() {
+  if (stream_server != nullptr) return true;
+
   httpd_config_t streamConfig = HTTPD_DEFAULT_CONFIG();
   streamConfig.server_port = 81;
   streamConfig.ctrl_port = 32769;
   streamConfig.max_uri_handlers = 4;
 
-  if (httpd_start(&stream_server, &streamConfig) == ESP_OK) {
-    httpd_uri_t streamUri = {};
-    streamUri.uri = "/stream";
-    streamUri.method = HTTP_GET;
-    streamUri.handler = stream_handler;
-    httpd_register_uri_handler(stream_server, &streamUri);
+  if (httpd_start(&stream_server, &streamConfig) != ESP_OK) {
+    stream_server = nullptr;
+    logPrintln("Stream server start failed");
+    return false;
+  }
+
+  httpd_uri_t streamUri = {};
+  streamUri.uri = "/stream";
+  streamUri.method = HTTP_GET;
+  streamUri.handler = stream_handler;
+
+  if (httpd_register_uri_handler(stream_server, &streamUri) != ESP_OK) {
+    logPrintln("Stream handler registration failed");
+    httpd_stop(stream_server);
+    stream_server = nullptr;
+    return false;
+  }
+
+  logPrintln("Stream server started");
+  return true;
+}
+
+static bool restartStreamServer() {
+  logPrintln("Restarting stream server");
+  streamRestartRequested = true;
+
+  delay(50);
+
+  if (stream_server != nullptr) {
+    httpd_stop(stream_server);
+    stream_server = nullptr;
+  }
+
+  streamClientCount = 0;
+  streamRestartRequested = false;
+  streamLastFrameMillis = millis();
+
+  if (!startStreamServer()) {
+    logPrintln("Stream server restart failed");
+    return false;
+  }
+
+  streamRestartCount++;
+  logPrintln("Stream server restarted");
+  return true;
+}
+
+static void maintainStreamWatchdog() {
+  if (streamClientCount <= 0 || streamLastFrameMillis == 0) return;
+
+  const unsigned long age = millis() - streamLastFrameMillis;
+  if (age < STREAM_WATCHDOG_TIMEOUT_MS) return;
+
+  logPrintf("Stream watchdog: no successful frame for %lu s\n",
+            age / 1000UL);
+
+  if (!restartStreamServer()) {
+    logPrintln("Rebooting ESP32 after stream recovery failure");
+    delay(500);
+    ESP.restart();
   }
 }
 
@@ -1753,6 +1849,7 @@ void loop() {
   maintainWifi();
   maintainNtp();
   checkForBetterAccessPoint();
+  maintainStreamWatchdog();
   logConsoleStatus();
   delay(250);
 }

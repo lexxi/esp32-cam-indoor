@@ -9,7 +9,7 @@
 
 #include "camera_pins.h"
 
-static const char *APP_VERSION = "0.8.9";
+static const char *APP_VERSION = "0.8.10";
 static const char *AP_PASSWORD = "esp32cam123";
 static const unsigned long WIFI_CONNECT_TIMEOUT_MS = 30000;
 static const unsigned long WIFI_RETRY_INTERVAL_MS = 30000;
@@ -1497,7 +1497,16 @@ static esp_err_t status_handler(httpd_req_t *req) {
 }
 
 static esp_err_t stream_handler(httpd_req_t *req) {
+  const bool firstActiveClient = (streamClientCount == 0);
   streamClientCount++;
+
+  // Give a newly opened stream a fresh watchdog grace period. Without this,
+  // the watchdog can inherit the age of the previous, already closed stream
+  // and immediately restart the server before the first frame is sent.
+  if (firstActiveClient) {
+    streamLastFrameMillis = millis();
+  }
+
   logPrintf("Stream client connected, clients=%d\n", streamClientCount);
 
   esp_err_t result = httpd_resp_set_type(req, STREAM_CONTENT_TYPE);

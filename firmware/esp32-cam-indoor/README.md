@@ -238,3 +238,18 @@ through the application logger.
 - Between failed attempts, the OV2640 sensor is power-cycled through the PWDN pin.
 - A partial camera-driver state is deinitialized before retrying.
 - If all three attempts fail, the existing ESP restart fallback remains in place.
+
+
+## v0.8.9 stream watchdog and client logging
+
+- Logs stream client connect/disconnect events including the active client count.
+- Tracks the timestamp of the last successfully transmitted MJPEG frame.
+- `/status` exposes:
+  - `stream_clients`
+  - `stream_restarts`
+  - `last_frame_age_s`
+- If at least one stream client is active and no frame has been sent successfully
+  for 30 seconds, the firmware restarts only the port-81 stream server.
+- If the stream server cannot be restarted, the ESP32 performs a full restart as
+  a fallback.
+- Idle cameras with no active stream client are not restarted by the watchdog.
